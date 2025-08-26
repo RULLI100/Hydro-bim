@@ -1,0 +1,440 @@
+
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+import {
+  Menubar,
+  MenubarContent,
+  MenubarItem,
+  MenubarMenu,
+  MenubarSeparator,
+  MenubarSub,
+  MenubarSubContent,
+  MenubarSubTrigger,
+  MenubarTrigger,
+} from "@/components/ui/menubar"
+import dynamic from 'next/dynamic';
+import type { MapRef } from '@/components/Map';
+import ModelingToolbar from '@/components/ModelingToolbar';
+import ProjectDialog from '@/components/ProjectDialog';
+import type { ProjectData } from '@/components/ProjectDialog';
+import { useToast } from '@/hooks/use-toast';
+import StatusDialog from '@/components/StatusDialog';
+import NodesDialog from '@/components/NodesDialog';
+import PipesDialog from '@/components/PipesDialog';
+import type { Node, Pipe } from '@/types/hydro';
+import type { LatLng, LatLngExpression } from 'leaflet';
+import { getElevation } from '../app/actions';
+import L from 'leaflet';
+
+
+const Map = dynamic(() => import('@/components/Map'), {
+  ssr: false,
+});
+
+
+export default function Home() {
+  const mapRef = useRef<MapRef>(null);
+  const [showModelingToolbar, setShowModelingToolbar] = useState(false);
+  const [isProjectDialogOpen, setIsProjectDialogOpen] = useState(false);
+  const [isStatusDialogOpen, setIsStatusDialogOpen] = useState(false);
+  const [isNodesDialogOpen, setIsNodesDialogOpen] = useState(false);
+  const [isPipesDialogOpen, setIsPipesDialogOpen] = useState(false);
+  const [projectData, setProjectData] = useState<ProjectData | null>(null);
+  const [drawingMode, setDrawingMode] = useState<'node' | 'pipe' | null>(null);
+  
+  const [nodes, setNodes] = useState<Node[]>([]);
+  const [pipes, setPipes] = useState<Pipe[]>([]);
+  const [drawingPipeState, setDrawingPipeState] = useState<{ startNode: Node | null }>({ startNode: null });
+
+  const { toast } = useToast();
+
+  const [mapCenter, setMapCenter] = useState<LatLngExpression>([-12.046374, -77.042793]);
+  const [mapZoom, setMapZoom] = useState<number>(13);
+
+  useEffect(() => {
+    try {
+      const savedData = localStorage.getItem('hydrobim-project-data');
+      if (savedData) {
+        const data = JSON.parse(savedData);
+        setProjectData(data);
+        toast({
+          title: "Proyecto Cargado",
+          description: `Se ha cargado el proyecto "${data.nombre}" desde la sesión local.`,
+        });
+        
+        if (data.latitud && data.longitud) {
+          const lat = parseFloat(data.latitud);
+          const lng = parseFloat(data.longitud);
+          if(!isNaN(lat) && !isNaN(lng)) {
+            setMapCenter([lat, lng]);
+            setMapZoom(15);
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Failed to load project data from localStorage", error);
+      toast({
+        title: "Error al cargar",
+        description: "No se pudieron cargar los datos del proyecto local.",
+        variant: "destructive",
+      });
+    }
+  }, [toast]);
+
+  const setMapLayer = (layer: 'streets' | 'topo' | 'satellite' | 'neutral') => {
+    mapRef.current?.setLayer(layer);
+  };
+
+  const toggleModelingToolbar = () => {
+    setShowModelingToolbar(prevState => !prevState);
+  };
+  
+  const handleOpenProjectDialog = () => {
+    setIsProjectDialogOpen(true);
+  };
+  
+  const handleMapClick = async (latlng: LatLng, clickedNode: Node | null) => {
+    if (drawingMode === 'node' && !clickedNode) {
+      const nextIdNumber = (nodes.length > 0 ? Math.max(...nodes.map(n => parseInt(n.id.substring(1)))) : 0) + 1;
+      const newId = `N${nextIdNumber}`;
+      
+      const newNode: Node = {
+        id: newId,
+        latitud: latlng.lat,
+        longitud: latlng.lng,
+        cotaTerreno: null,
+        type: 'node',
+      };
+
+      setNodes(prevNodes => [...prevNodes, newNode]);
+      
+      toast({
+        title: "Obteniendo Elevación...",
+        description: `Buscando cota para el nudo ${newId}.`,
+      });
+
+      try {
+        const elevation = await getElevation(latlng.lat, latlng.lng);
+        if (elevation !== null) {
+          setNodes(prevNodes => prevNodes.map(n => 
+            n.id === newId ? { ...n, cotaTerreno: elevation } : n
+          ));
+          toast({
+            title: "Elevación Obtenida",
+            description: `La cota para el nudo ${newId} es ${elevation.toFixed(2)} m.s.n.m.`,
+          });
+        } else {
+           toast({
+            title: "Error de Elevación",
+            description: `No se pudo obtener la cota para el nudo ${newId}.`,
+            variant: 'destructive',
+          });
+        }
+      } catch (error) {
+        toast({
+          title: "Error de Red",
+          description: `Fallo al conectar con la API de elevación.`,
+          variant: 'destructive',
+        });
+      }
+    } else if (drawingMode === 'pipe' && clickedNode) {
+      if (!drawingPipeState.startNode) {
+        // Start drawing a pipe
+        setDrawingPipeState({ startNode: clickedNode });
+        mapRef.current?.highlightNode(clickedNode.id, true);
+        mapRef.current?.startGuideLine([clickedNode.latitud, clickedNode.longitud]);
+      } else {
+        // Finish drawing a pipe
+        const startNode = drawingPipeState.startNode;
+        const endNode = clickedNode;
+
+        if (startNode.id === endNode.id) return; // Can't connect a node to itself
+
+        const nextPipeNumber = (pipes.length > 0 ? Math.max(...pipes.map(p => parseInt(p.id.substring(2)))) : 0) + 1;
+        const newPipeId = `T-${nextPipeNumber}`;
+
+        const startLatLng = L.latLng(startNode.latitud, startNode.longitud);
+        const endLatLng = L.latLng(endNode.latitud, endNode.longitud);
+        const length = startLatLng.distanceTo(endLatLng);
+
+        const newPipe: Pipe = {
+          id: newPipeId,
+          startNodeId: startNode.id,
+          endNodeId: endNode.id,
+          length: length,
+          type: 'distribution',
+        };
+
+        setPipes(prevPipes => [...prevPipes, newPipe]);
+        
+        toast({
+          title: "Tubería Creada",
+          description: `Se ha creado la tubería ${newPipe.id} entre ${startNode.id} y ${endNode.id} con una longitud de ${length.toFixed(2)}m.`
+        });
+        
+        // Continuous drawing: set the end node as the new start node
+        mapRef.current?.highlightNode(startNode.id, false); // unhighlight previous start node
+        setDrawingPipeState({ startNode: endNode });
+        mapRef.current?.highlightNode(endNode.id, true);
+        mapRef.current?.startGuideLine([endNode.latitud, endNode.longitud]);
+      }
+    }
+  };
+
+  useEffect(() => {
+    mapRef.current?.clearElements();
+    nodes.forEach(node => {
+      if (node && node.latitud != null && node.longitud != null) {
+        const tooltipContent = `
+          <div style="text-align: left;">
+            <strong>Nudo ${node.id}</strong><br/>
+            Latitud: ${node.latitud.toFixed(6)}<br/>
+            Longitud: ${node.longitud.toFixed(6)}<br/>
+            Cota: ${node.cotaTerreno !== null ? node.cotaTerreno.toFixed(2) + ' m' : 'Calculando...'}
+          </div>
+        `;
+        mapRef.current?.addNodeMarker(
+            { lat: node.latitud, lng: node.longitud }, 
+            tooltipContent, 
+            node.id
+        );
+      }
+    });
+
+    pipes.forEach(pipe => {
+      const startNode = nodes.find(n => n.id === pipe.startNodeId);
+      const endNode = nodes.find(n => n.id === pipe.endNodeId);
+      if (startNode && endNode) {
+        mapRef.current?.addPipePolyline(
+          [{lat: startNode.latitud, lng: startNode.longitud}, {lat: endNode.latitud, lng: endNode.longitud}]
+        );
+      }
+    });
+
+  }, [nodes, pipes, drawingMode]); // Re-run when drawingMode changes to show/hide tooltips
+
+  const handleSaveProjectDialog = (data: ProjectData) => {
+    handleSave(data);
+    setIsProjectDialogOpen(false);
+    
+    if (data.latitud && data.longitud) {
+       const lat = parseFloat(data.latitud);
+       const lng = parseFloat(data.longitud);
+       if (!isNaN(lat) && !isNaN(lng)) {
+           // Use a timeout to ensure the map component has re-rendered
+           setTimeout(() => {
+             mapRef.current?.setView([lat, lng], 15);
+           }, 100);
+           setMapCenter([lat, lng]);
+           setMapZoom(15);
+       }
+    }
+
+    toast({
+      title: "Datos de Proyecto Guardados",
+      description: `La información y ubicación del proyecto "${data.nombre}" ha sido guardada.`,
+    });
+  };
+  
+  const handleSave = (dataToSave: ProjectData | null) => {
+    const currentData = dataToSave || projectData;
+    if (!currentData) {
+      toast({
+        title: "No hay proyecto para guardar",
+        description: "Crea o abre un proyecto primero.",
+        variant: "destructive",
+      });
+      return;
+    }
+    setProjectData(currentData); // Keep UI state in sync
+    try {
+      localStorage.setItem('hydrobim-project-data', JSON.stringify(currentData));
+      toast({
+        title: "Proyecto Guardado Localmente",
+        description: `El proyecto "${currentData.nombre}" se guardó en el navegador.`,
+      });
+    } catch (error) {
+      console.error("Failed to save project data to localStorage", error);
+      toast({
+        title: "Error al Guardar",
+        description: "No se pudo guardar el proyecto localmente.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleSaveAs = () => {
+    if (!projectData) {
+      toast({
+        title: "No hay datos que guardar",
+        description: "Primero crea un nuevo proyecto o abre uno existente.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const jsonString = JSON.stringify(projectData, null, 2);
+    const blob = new Blob([jsonString], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${projectData.nombre.replace(/\s+/g, '_') || 'hydrobim-project'}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast({
+      title: "Proyecto Descargado",
+      description: "Los datos del proyecto se han guardado en un archivo JSON.",
+    });
+  };
+
+  const handleOpenStatusDialog = () => {
+    setIsStatusDialogOpen(true);
+  };
+
+  const handleToolSelect = (tool: 'node' | 'pipe' | 'project' | null) => {
+    // Un-highlight any previously selected node when changing tools
+    if (drawingPipeState.startNode) {
+        mapRef.current?.highlightNode(drawingPipeState.startNode.id, false);
+    }
+    setDrawingPipeState({ startNode: null }); // Reset pipe drawing on tool change
+    mapRef.current?.stopGuideLine();
+    
+    if (tool === 'project') {
+      handleOpenProjectDialog();
+      setDrawingMode(null);
+    } else {
+      setDrawingMode(prev => {
+        const newMode = prev === tool ? null : tool;
+        if (newMode === null) {
+            // If we are de-selecting a tool, make sure to stop guide lines
+            mapRef.current?.stopGuideLine();
+        }
+        return newMode;
+      });
+    }
+  };
+
+
+  return (
+    <main className="flex flex-col h-screen">
+      <header className="flex h-14 items-center border-b px-4 flex-shrink-0 relative z-20 bg-background">
+        <h1 className="text-xl font-bold">HydroBIM</h1>
+        <Menubar className="ml-6 border-none shadow-none">
+          <MenubarMenu>
+            <MenubarTrigger>Archivo</MenubarTrigger>
+            <MenubarContent>
+              <MenubarItem onSelect={handleOpenProjectDialog}>Nuevo</MenubarItem>
+              <MenubarItem>Abrir</MenubarItem>
+              <MenubarSeparator />
+              <MenubarItem onSelect={() => handleSave(null)}>Guardar</MenubarItem>
+              <MenubarItem onSelect={handleSaveAs}>Guardar Como</MenubarItem>
+              <MenubarSeparator />
+              <MenubarItem>Importar</MenubarItem>
+              <MenubarItem>Exportar</MenubarItem>
+              <MenubarSeparator />
+              <MenubarItem>Salir</MenubarItem>
+            </MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Datos</MenubarTrigger>
+            <MenubarContent>
+              <MenubarItem onSelect={handleOpenProjectDialog}>Proyecto</MenubarItem>
+              <MenubarItem>Parámetros de Diseño</MenubarItem>
+              <MenubarItem>Alcances del Aplicativo</MenubarItem>
+            </MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Mapa GIS</MenubarTrigger>
+            <MenubarContent>
+              <MenubarItem onSelect={() => setMapLayer('streets')}>Calles</MenubarItem>
+              <MenubarItem onSelect={() => setMapLayer('topo')}>Topografía</MenubarItem>
+              <MenubarItem onSelect={() => setMapLayer('satellite')}>Satelital</MenubarItem>
+              <MenubarItem onSelect={() => setMapLayer('neutral')}>Neutral</MenubarItem>
+            </MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Modelado</MenubarTrigger>
+            <MenubarContent>
+              <MenubarItem onSelect={toggleModelingToolbar}>Herramienta de Modelado</MenubarItem>
+              <MenubarItem>Topografía</MenubarItem>
+            </MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Sistema o Red</MenubarTrigger>
+            <MenubarContent>
+              <MenubarSub>
+                <MenubarSubTrigger>Datos del Modelado</MenubarSubTrigger>
+                <MenubarSubContent>
+                  <MenubarItem onSelect={() => setIsNodesDialogOpen(true)}>Nudos</MenubarItem>
+                  <MenubarItem>Vértices</MenubarItem>
+                  <MenubarItem onSelect={() => setIsPipesDialogOpen(true)}>Tuberías de Distribución</MenubarItem>
+                  <MenubarItem>Tuberías de Aducción</MenubarItem>
+                  <MenubarItem>Tuberías de Conducción</MenubarItem>
+                  <MenubarItem>Reservorios</MenubarItem>
+                  <MenubarItem>PTAPs</MenubarItem>
+                  <MenubarItem>Bocatomas</MenubarItem>
+                </MenubarSubContent>
+              </MenubarSub>
+            </MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Simulación</MenubarTrigger>
+            <MenubarContent></MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Configuración</MenubarTrigger>
+            <MenubarContent></MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Ayuda</MenubarTrigger>
+            <MenubarContent>
+              <MenubarItem onSelect={handleOpenStatusDialog}>
+                Estado de Funcionalidad del Aplicativo
+              </MenubarItem>
+            </MenubarContent>
+          </MenubarMenu>
+        </Menubar>
+      </header>
+      <div className="flex-grow relative z-10">
+        <Map 
+          ref={mapRef} 
+          onMapClick={handleMapClick} 
+          drawingMode={drawingMode}
+          initialCenter={mapCenter}
+          initialZoom={mapZoom}
+          nodes={nodes}
+          hideNodeTooltips={drawingMode === 'pipe'}
+        />
+        {showModelingToolbar && <ModelingToolbar onToolSelect={handleToolSelect} activeTool={drawingMode} />}
+        <div className="absolute bottom-4 left-4 z-[999] p-2 bg-background/80 backdrop-blur-sm rounded-md shadow-md text-xs">
+            <div>Autor: Ing. Rulli Llancari Anyaipoma</div>
+            <div>BIM Proyectos Integrados SAC</div>
+        </div>
+      </div>
+      <ProjectDialog 
+        isOpen={isProjectDialogOpen} 
+        onOpenChange={setIsProjectDialogOpen}
+        onSave={handleSaveProjectDialog}
+        initialData={projectData}
+      />
+      <StatusDialog 
+        isOpen={isStatusDialogOpen}
+        onOpenChange={setIsStatusDialogOpen}
+      />
+      <NodesDialog
+        isOpen={isNodesDialogOpen}
+        onOpenChange={setIsNodesDialogOpen}
+        nodes={nodes}
+      />
+       <PipesDialog
+        isOpen={isPipesDialogOpen}
+        onOpenChange={setIsPipesDialogOpen}
+        pipes={pipes.filter(p => p.type === 'distribution')}
+      />
+    </main>
+  );
+}
+
