@@ -6,12 +6,21 @@ import { useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
 import L from 'leaflet';
 import type { Node, Pipe } from '@/types/hydro';
 
+type PolylineOptions = {
+    color?: string;
+    weight?: number;
+    opacity?: number;
+    dashArray?: string;
+};
+
 export interface MapRef {
   setLayer: (layer: 'streets' | 'topo' | 'satellite' | 'neutral') => void;
   setView: (position: L.LatLngExpression, zoom?: number) => void;
   highlightNode: (nodeId: string, highlight: boolean) => void;
-  startGuideLine: (startPos: L.LatLngExpression) => void;
+  startGuideLine: (startPos: L.LatLngExpression, options?: PolylineOptions) => void;
   stopGuideLine: () => void;
+  drawMeasurementResultLine: (startPos: L.LatLngExpression, endPos: L.LatLngExpression) => void;
+  clearMeasurementResultLine: () => void;
 }
 
 const tileLayers = {
@@ -30,8 +39,8 @@ const tileLayers = {
 };
 
 interface MapProps {
-  onMapClick?: (latlng: L.LatLng, clickedNode: Node | null) => void;
-  drawingMode: 'node' | 'pipe' | 'reservoir' | 'valve' | 'pump' | 'tank' | 'wtp' | 'well' | 'intake' | 'vertex' | 'dual' | 'mesh' | 'delete-component' | 'delete-pipe' | 'delete-selection' | 'clean' | 'purge' | 'renumber' | 'move' | 'viewer' | 'undo' | null;
+  onMapClick?: (latlng: L.LatLng, clickedNode: Node | null, clickedPipe: Pipe | null) => void;
+  drawingMode: 'node' | 'pipe' | 'reservoir' | 'valve' | 'pump' | 'tank' | 'wtp' | 'well' | 'intake' | 'vertex' | 'dual' | 'mesh' | 'delete-component' | 'measure' | 'delete-selection' | 'clean' | 'purge' | 'renumber' | 'move' | 'viewer' | 'undo' | null;
   initialCenter: L.LatLngExpression;
   initialZoom: number;
   nodes: Node[];
@@ -46,7 +55,10 @@ const MapComponent = forwardRef<MapRef, MapProps>(({ onMapClick, drawingMode, in
   const nodeMarkersRef = useRef(new Map<string, L.Marker>());
   const pipePolylinesRef = useRef(new Map<string, L.Polyline>());
   const guideLineRef = useRef<L.Polyline | null>(null);
+  const measurementResultLineRef = useRef<L.Polyline | null>(null);
   const onMapClickRef = useRef(onMapClick);
+  const activeTooltipTimeout = useRef<NodeJS.Timeout | null>(null);
+
 
   useEffect(() => {
     onMapClickRef.current = onMapClick;
@@ -54,9 +66,12 @@ const MapComponent = forwardRef<MapRef, MapProps>(({ onMapClick, drawingMode, in
 
   useEffect(() => {
     if (mapContainerRef.current) {
-        if (drawingMode === 'node' || drawingMode === 'pipe') {
+        if (drawingMode === 'node' || drawingMode === 'pipe' || drawingMode === 'dual' || drawingMode === 'mesh' || drawingMode === 'measure') {
             mapContainerRef.current.style.cursor = 'crosshair';
-        } else {
+        } else if (drawingMode === 'delete-component') {
+            mapContainerRef.current.style.cursor = 'pointer';
+        }
+        else {
             mapContainerRef.current.style.cursor = '';
         }
     }
@@ -84,7 +99,7 @@ const MapComponent = forwardRef<MapRef, MapProps>(({ onMapClick, drawingMode, in
 
       map.on('click', (e) => {
         if (onMapClickRef.current) {
-            onMapClickRef.current(e.latlng, null);
+            onMapClickRef.current(e.latlng, null, null);
         }
       });
 
@@ -137,22 +152,37 @@ const MapComponent = forwardRef<MapRef, MapProps>(({ onMapClick, drawingMode, in
                 marker.on('click', (e) => {
                     L.DomEvent.stopPropagation(e);
                     if (onMapClickRef.current) {
-                        onMapClickRef.current(e.latlng, node);
+                        onMapClickRef.current(e.latlng, node, null);
                     }
+                    marker.openTooltip();
+                    if(activeTooltipTimeout.current) clearTimeout(activeTooltipTimeout.current);
+                    activeTooltipTimeout.current = setTimeout(() => {
+                        marker.closeTooltip();
+                    }, 10000);
                 });
-
+                
+                marker.bindTooltip(tooltipContent, { permanent: false, direction: 'top', offset: L.point(0, -10), className: 'node-tooltip' });
                 nodeMarkersRef.current.set(node.id, marker);
-                if (!hideNodeTooltips) {
-                    marker.bindTooltip(tooltipContent, { permanent: false, direction: 'top', offset: L.point(0, -10), className: 'node-tooltip' });
-                }
+
             } else {
                 existingMarker.setLatLng([node.latitud, node.longitud]);
-                if (hideNodeTooltips) {
-                    existingMarker.unbindTooltip();
+                if (existingMarker.getTooltip()) {
+                    existingMarker.setTooltipContent(tooltipContent);
                 } else {
-                    existingMarker.unbindTooltip().bindTooltip(tooltipContent, { permanent: false, direction: 'top', offset: L.point(0, -10), className: 'node-tooltip' });
+                    existingMarker.bindTooltip(tooltipContent, { permanent: false, direction: 'top', offset: L.point(0, -10), className: 'node-tooltip' });
                 }
             }
+
+             const marker = nodeMarkersRef.current.get(node.id);
+             if (marker) {
+                if (hideNodeTooltips) {
+                    if (marker.getTooltip()) {
+                        marker.unbindTooltip();
+                    }
+                } else if (!marker.getTooltip()) {
+                    marker.bindTooltip(tooltipContent, { permanent: false, direction: 'top', offset: L.point(0, -10), className: 'node-tooltip' });
+                }
+             }
         }
     });
 
@@ -196,9 +226,25 @@ const MapComponent = forwardRef<MapRef, MapProps>(({ onMapClick, drawingMode, in
             }).addTo(map);
 
             polyline.bindTooltip(tooltipContent, { className: 'pipe-tooltip' });
+            
+            polyline.on('click', (e) => {
+                L.DomEvent.stopPropagation(e);
+                if (onMapClickRef.current) {
+                    onMapClickRef.current(e.latlng, null, pipe);
+                }
+            });
 
-            polyline.on('mouseover', () => polyline.setStyle({ color: 'red', weight: 5 }));
-            polyline.on('mouseout', () => polyline.setStyle({ color: 'blue', weight: 3 }));
+            const highlight = () => {
+                polyline.setStyle({ color: 'red', weight: 5 });
+                if (drawingMode === 'delete-component') mapContainerRef.current!.style.cursor = 'pointer';
+            };
+            const unhighlight = () => {
+                polyline.setStyle({ color: 'blue', weight: 3 });
+                if (drawingMode === 'delete-component') mapContainerRef.current!.style.cursor = 'pointer'; 
+            };
+            
+            polyline.on('mouseover', highlight);
+            polyline.on('mouseout', unhighlight);
 
             pipePolylinesRef.current.set(pipe.id, polyline);
         } else {
@@ -206,7 +252,7 @@ const MapComponent = forwardRef<MapRef, MapProps>(({ onMapClick, drawingMode, in
             existingPolyline.unbindTooltip().bindTooltip(tooltipContent);
         }
     });
-  }, [nodes, pipes, hideNodeTooltips, initialCenter, initialZoom]);
+  }, [nodes, pipes, hideNodeTooltips, initialCenter, initialZoom, drawingMode]);
 
 
   useImperativeHandle(ref, () => ({
@@ -256,21 +302,38 @@ const MapComponent = forwardRef<MapRef, MapProps>(({ onMapClick, drawingMode, in
             iconEl.style.borderColor = '#4682B4';
         }
     },
-    startGuideLine: (startPos) => {
+    startGuideLine: (startPos, options) => {
         if (!mapInstanceRef.current) return;
         if (guideLineRef.current) {
             guideLineRef.current.remove();
         }
-        guideLineRef.current = L.polyline([startPos, startPos], {
+        const defaultOptions = {
             color: 'green',
             weight: 2,
             dashArray: '5, 10',
-        }).addTo(mapInstanceRef.current);
+        };
+        guideLineRef.current = L.polyline([startPos, startPos], { ...defaultOptions, ...options }).addTo(mapInstanceRef.current);
     },
     stopGuideLine: () => {
         if (guideLineRef.current) {
             guideLineRef.current.remove();
             guideLineRef.current = null;
+        }
+    },
+    drawMeasurementResultLine: (startPos, endPos) => {
+        if (!mapInstanceRef.current) return;
+        if (measurementResultLineRef.current) {
+            measurementResultLineRef.current.remove();
+        }
+        measurementResultLineRef.current = L.polyline([startPos, endPos], {
+            color: 'red',
+            weight: 3,
+        }).addTo(mapInstanceRef.current);
+    },
+    clearMeasurementResultLine: () => {
+        if (measurementResultLineRef.current) {
+            measurementResultLineRef.current.remove();
+            measurementResultLineRef.current = null;
         }
     },
   }));
@@ -298,4 +361,3 @@ const MapComponent = forwardRef<MapRef, MapProps>(({ onMapClick, drawingMode, in
 MapComponent.displayName = 'MapComponent';
 
 export default MapComponent;
-    
