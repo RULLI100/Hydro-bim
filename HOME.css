@@ -1,0 +1,1037 @@
+
+'use client';
+
+import { useEffect, useRef, useState, useCallback } from 'react';
+import {
+  Menubar,
+  MenubarContent,
+  MenubarItem,
+  MenubarMenu,
+  MenubarSeparator,
+  MenubarSub,
+  MenubarSubContent,
+  MenubarSubTrigger,
+  MenubarTrigger,
+} from "@/components/ui/menubar"
+import dynamic from 'next/dynamic';
+import type { MapRef } from '@/components/Map';
+import ModelingToolbar from '@/components/ModelingToolbar';
+import ProjectDialog from '@/components/ProjectDialog';
+import type { ProjectData } from '@/components/ProjectDialog';
+import { useToast } from '@/hooks/use-toast';
+import StatusDialog from '@/components/StatusDialog';
+import NodesDialog from '@/components/NodesDialog';
+import PipesDialog from '@/components/PipesDialog';
+import type { Node, Pipe } from '@/types/hydro';
+import type { LatLng, LatLngExpression } from 'leaflet';
+import { getElevation } from '../app/actions';
+import { saveAs } from 'file-saver';
+import SaveAsDialog from './SaveAsDialog';
+import ScopesDialog from './ScopesDialog';
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from './ui/alert-dialog';
+import { processKmlFile } from '@/lib/kml-importer';
+import CsvImportDialog from './CsvImportDialog';
+import Papa from 'papaparse';
+import CsvExportDialog from './CsvExportDialog';
+import JSZip from 'jszip';
+import { generateKml } from '@/lib/kml-generator';
+
+
+const MapComponent = dynamic(() => import('@/components/Map'), {
+  ssr: false,
+});
+
+type DrawingMode = 'node' | 'pipe' | 'reservoir' | 'valve' | 'pump' | 'tank' | 'wtp' | 'well' | 'intake' | 'vertex' | 'dual' | 'mesh' | 'delete-component' | 'delete-pipe' | 'delete-selection' | 'clean' | 'purge' | 'renumber' | 'move' | 'viewer' | 'undo';
+
+export type HydroModel = {
+  nodes: Node[];
+  pipes: Pipe[];
+};
+
+const initialModel: HydroModel = { nodes: [], pipes: [] };
+
+
+export default function Home() {
+  const mapRef = useRef<MapRef>(null);
+  const importKmlInputRef = useRef<HTMLInputElement>(null);
+  const openProjectFileInputRef = useRef<HTMLInputElement>(null);
+  const [showModelingToolbar, setShowModelingToolbar] = useState(false);
+  const [isProjectDialogOpen, setIsProjectDialogOpen] = useState(false);
+  const [isStatusDialogOpen, setIsStatusDialogOpen] = useState(false);
+  const [isScopesDialogOpen, setIsScopesDialogOpen] = useState(false);
+  const [isNodesDialogOpen, setIsNodesDialogOpen] = useState(false);
+  const [isPipesDialogOpen, setIsPipesDialogOpen] = useState(false);
+  const [isSaveAsDialogOpen, setIsSaveAsDialogOpen] = useState(false);
+  const [isCleanConfirmDialogOpen, setIsCleanConfirmDialogOpen] = useState(false);
+  const [isCsvImportDialogOpen, setIsCsvImportDialogOpen] = useState(false);
+  const [isCsvExportDialogOpen, setIsCsvExportDialogOpen] = useState(false);
+  const [isExitConfirmDialogOpen, setIsExitConfirmDialogOpen] = useState(false);
+
+  const [projectData, setProjectData] = useState<ProjectData | null>(null);
+  const [drawingMode, setDrawingMode] = useState<DrawingMode | null>(null);
+  const [drawingPipeState, setDrawingPipeState] = useState<{ startNode: Node | null }>({ startNode: null });
+  const [hideNodeTooltips, setHideNodeTooltips] = useState(false);
+  
+  const { toast } = useToast();
+
+  const [mapCenter, setMapCenter] = useState<LatLngExpression>([-12.046374, -77.042793]);
+  const [mapZoom, setMapZoom] = useState<number>(13);
+
+  const [model, setModel] = useState<HydroModel>(initialModel);
+  const [history, setHistory] = useState<HydroModel[]>([initialModel]);
+  const [historyIndex, setHistoryIndex] = useState(0);
+
+  const { nodes, pipes } = model;
+  
+  const updateModel = useCallback((modelUpdater: (current: HydroModel) => HydroModel) => {
+    setModel(prevModel => {
+        const newModel = modelUpdater(prevModel);
+        const newHistoryState = [...history.slice(0, historyIndex + 1), newModel];
+        setHistory(newHistoryState);
+        setHistoryIndex(newHistoryState.length - 1);
+        return newModel;
+    });
+  }, [history, historyIndex]);
+
+  useEffect(() => {
+    try {
+      const savedData = localStorage.getItem('hydrobim-project-data');
+      if (savedData) {
+        const parsedData = JSON.parse(savedData);
+        if (parsedData.project && parsedData.history && typeof parsedData.historyIndex === 'number') {
+          setProjectData(parsedData.project);
+          
+          const loadedHistory = parsedData.history;
+          const loadedHistoryIndex = parsedData.historyIndex;
+          
+          setHistory(loadedHistory);
+          setHistoryIndex(loadedHistoryIndex);
+          setModel(loadedHistory[loadedHistoryIndex] || initialModel);
+
+          if (parsedData.project.latitud && parsedData.project.longitud) {
+            const lat = parseFloat(parsedData.project.latitud);
+            const lng = parseFloat(parsedData.project.longitud);
+            if (!isNaN(lat) && !isNaN(lng)) {
+              setMapCenter([lat, lng]);
+              setMapZoom(15);
+            }
+          }
+          
+          const currentModel = loadedHistory[loadedHistoryIndex];
+          if(currentModel && (currentModel.nodes.length > 0 || currentModel.pipes.length > 0)) {
+            setTimeout(() => {
+                toast({
+                  title: "Proyecto Cargado",
+                  description: `Se ha cargado el proyecto "${parsedData.project.nombre}" desde la sesión anterior.`,
+                });
+            }, 100);
+          }
+        }
+      } else {
+        setModel(initialModel);
+        setHistory([initialModel]);
+        setHistoryIndex(0);
+      }
+    } catch (error) {
+      console.error("Failed to load or parse project data from localStorage", error);
+      setModel(initialModel);
+      setHistory([initialModel]);
+      setHistoryIndex(0);
+      setTimeout(() => {
+          toast({
+            title: "Error al cargar",
+            description: "No se pudo cargar el proyecto guardado. Puede estar corrupto.",
+            variant: "destructive",
+          });
+      }, 100);
+    }
+  }, [toast]); 
+
+  const cancelDrawing = useCallback(() => {
+    if (drawingPipeState.startNode) {
+      mapRef.current?.highlightNode(drawingPipeState.startNode.id, false);
+    }
+    setDrawingPipeState({ startNode: null });
+    setDrawingMode(null);
+    mapRef.current?.stopGuideLine();
+    if (drawingMode) {
+        toast({
+            title: "Modelado Cancelado",
+            description: "Se ha salido del modo de dibujo.",
+        });
+    }
+  }, [drawingMode, drawingPipeState.startNode, toast]);
+
+  const resetPipeDrawing = () => {
+    if (drawingPipeState.startNode) {
+        mapRef.current?.highlightNode(drawingPipeState.startNode.id, false);
+        setDrawingPipeState({ startNode: null });
+        mapRef.current?.stopGuideLine();
+        toast({
+            title: "Dibujo de Tubería Reiniciado",
+            description: "Seleccione un nuevo nudo de inicio.",
+        });
+    }
+  }
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        cancelDrawing();
+      }
+      if (event.key === 'Enter') {
+          if (drawingMode === 'pipe' && drawingPipeState.startNode) {
+              resetPipeDrawing();
+          }
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [drawingMode, drawingPipeState.startNode, cancelDrawing]);
+
+  const setMapLayer = (layer: 'streets' | 'topo' | 'satellite' | 'neutral') => {
+    mapRef.current?.setLayer(layer);
+  };
+
+  const toggleModelingToolbar = () => {
+    setShowModelingToolbar(prevState => !prevState);
+  };
+  
+  const handleOpenProjectDialog = () => {
+    setIsProjectDialogOpen(true);
+  };
+
+  const handleClean = useCallback(() => {
+    updateModel(() => initialModel);
+    localStorage.removeItem('hydrobim-project-data');
+    toast({
+        title: "Lienzo Limpiado",
+        description: "Se han borrado todos los nudos y tuberías del modelo.",
+    });
+  }, [toast, updateModel]);
+
+
+  const handleNewProject = useCallback(() => {
+    setProjectData(null);
+    updateModel(() => initialModel);
+    
+    const defaultCenter: LatLngExpression = [-12.046374, -77.042793];
+    setMapCenter(defaultCenter);
+    setMapZoom(13);
+    mapRef.current?.setView(defaultCenter, 13);
+    
+    setIsProjectDialogOpen(true);
+    
+    setTimeout(() => {
+      toast({
+        title: "Nuevo Proyecto Iniciado",
+        description: "Introduce los datos para tu nuevo proyecto. El lienzo ha sido limpiado.",
+      });
+    }, 100);
+  }, [toast, updateModel]);
+  
+  const handleMapClick = async (latlng: LatLng, clickedNode: Node | null) => {
+    if (drawingMode === 'node' && !clickedNode) {
+        toast({ title: "Obteniendo cota del terreno...", description: "Por favor espere." });
+        const elevation = await getElevation(latlng.lat, latlng.lng);
+        
+        if (elevation === null) {
+            toast({ title: "Error al obtener la cota", description: "No se pudo obtener la cota del terreno para este punto. Inténtelo de nuevo.", variant: "destructive" });
+            return;
+        }
+
+        updateModel(current => {
+            const nextNodeId = (current.nodes.length > 0 ? Math.max(...current.nodes.map(n => parseInt(n.id.substring(1)) || 0)) : 0) + 1;
+            const newId = `N${nextNodeId}`;
+            const newNode: Node = {
+                id: newId,
+                latitud: latlng.lat,
+                longitud: latlng.lng,
+                cotaTerreno: elevation,
+                type: 'node',
+            };
+            toast({ title: "Nudo Creado", description: `Se ha creado el nudo ${newNode.id} con cota ${elevation.toFixed(2)}m.`});
+            return { ...current, nodes: [...current.nodes, newNode] };
+        });
+    } else if (drawingMode === 'pipe' && clickedNode) {
+      if (!drawingPipeState.startNode) {
+        setDrawingPipeState({ startNode: clickedNode });
+        mapRef.current?.highlightNode(clickedNode.id, true);
+        mapRef.current?.startGuideLine([clickedNode.latitud, clickedNode.longitud]);
+      } else {
+        const startNode = drawingPipeState.startNode;
+        const endNode = clickedNode;
+
+        if (startNode.id === endNode.id) return;
+        
+        const startLatLng = { lat: startNode.latitud, lng: startNode.longitud };
+        const endLatLng = { lat: endNode.latitud, lng: endNode.longitud };
+        const R = 6371e3; // metres
+        const φ1 = startLatLng.lat * Math.PI/180; // φ, λ in radians
+        const φ2 = endLatLng.lat * Math.PI/180;
+        const Δφ = (endLatLng.lat-startLatLng.lat) * Math.PI/180;
+        const Δλ = (endLatLng.lng-startLatLng.lng) * Math.PI/180;
+        const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+                  Math.cos(φ1) * Math.cos(φ2) *
+                  Math.sin(Δλ/2) * Math.sin(Δλ/2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+        const length = R * c; // in metres
+
+        updateModel(current => {
+            const nextPipeNumber = (current.pipes.length > 0 ? Math.max(...current.pipes.map(p => parseInt(p.id.substring(2)) || 0)) : 0) + 1;
+            const newPipeId = `T-${nextPipeNumber}`;
+            
+            const newPipe: Pipe = {
+              id: newPipeId,
+              startNodeId: startNode.id,
+              endNodeId: endNode.id,
+              length: length,
+              type: 'distribution',
+            };
+
+            const newPipes = [...current.pipes, newPipe];
+            
+            toast({
+              title: "Tubería Creada",
+              description: `Se ha creado la tubería ${newPipe.id} entre ${startNode.id} y ${endNode.id} con una longitud de ${length.toFixed(2)}m.`
+            });
+            
+            mapRef.current?.highlightNode(startNode.id, false); 
+            setDrawingPipeState({ startNode: endNode });
+            mapRef.current?.highlightNode(endNode.id, true);
+            mapRef.current?.startGuideLine([endNode.latitud, endNode.longitud]);
+            
+            return { ...current, pipes: newPipes };
+        });
+      }
+    }
+  };
+
+  const handleSave = () => {
+    if (!projectData) {
+      toast({
+        title: "No hay proyecto para guardar",
+        description: "Crea o abre un proyecto primero.",
+        variant: "destructive",
+      });
+      return;
+    }
+  
+    const fullProjectState = {
+      project: projectData,
+      history: history,
+      historyIndex: historyIndex,
+    };
+  
+    try {
+      localStorage.setItem('hydrobim-project-data', JSON.stringify(fullProjectState));
+      toast({
+        title: "Proyecto Guardado Localmente",
+        description: `El proyecto "${projectData.nombre}" se guardó en el navegador.`,
+      });
+    } catch (error) {
+      console.error("Failed to save project data to localStorage", error);
+      toast({
+        title: "Error al Guardar",
+        description: "No se pudo guardar el proyecto localmente.",
+        variant: "destructive",
+      });
+    }
+  };
+  
+  const handleSaveProjectDialog = (data: ProjectData) => {
+    setProjectData(data);
+    setIsProjectDialogOpen(false);
+
+    const fullProjectState = {
+      project: data,
+      history: history,
+      historyIndex: historyIndex,
+    };
+  
+    try {
+      localStorage.setItem('hydrobim-project-data', JSON.stringify(fullProjectState));
+      toast({
+        title: "Datos de Proyecto Guardados",
+        description: `La información del proyecto "${data.nombre}" ha sido actualizada y guardada.`,
+      });
+    } catch (error) {
+      console.error("Failed to save project data to localStorage", error);
+      toast({
+        title: "Error al Guardar",
+        description: "No se pudo guardar el proyecto localmente.",
+        variant: "destructive",
+      });
+    }
+
+    if (data.latitud && data.longitud) {
+       const lat = parseFloat(data.latitud);
+       const lng = parseFloat(data.longitud);
+       if (!isNaN(lat) && !isNaN(lng)) {
+           setTimeout(() => {
+             mapRef.current?.setView([lat, lng], 15);
+           }, 100);
+           setMapCenter([lat, lng]);
+           setMapZoom(15);
+       }
+    }
+  };
+  
+  const handleOpenSaveAsDialog = () => {
+    if (!projectData) {
+      toast({
+        title: "No hay datos que guardar",
+        description: "Primero crea un nuevo proyecto o abre uno existente.",
+        variant: "destructive",
+      });
+      return;
+    }
+    setIsSaveAsDialogOpen(true);
+  };
+
+  const executeSaveAs = (fileName: string) => {
+    if (!projectData) return;
+
+    try {
+      const fullProjectData = {
+        project: projectData,
+        history: history,
+        historyIndex: historyIndex
+      };
+      const jsonString = JSON.stringify(fullProjectData, null, 2);
+      const blob = new Blob([jsonString], { type: "application/json;charset=utf-8" });
+      saveAs(blob, `${fileName}.json`);
+      toast({
+        title: "Proyecto Descargado",
+        description: `El proyecto se ha guardado como "${fileName}.json".`,
+      });
+    } catch (error) {
+      console.error("Failed to save file:", error);
+      toast({
+        title: "Error al Guardar Archivo",
+        description: "No se pudo generar o guardar el archivo del proyecto.",
+        variant: "destructive",
+      });
+    }
+  };
+
+
+  const handleOpenStatusDialog = () => {
+    setIsStatusDialogOpen(true);
+  };
+
+  const handleOpenScopesDialog = () => {
+    setIsScopesDialogOpen(true);
+  };
+
+  const handleUndo = () => {
+    if (historyIndex > 0) {
+        const newIndex = historyIndex - 1;
+        setHistoryIndex(newIndex);
+        setModel(history[newIndex]);
+        toast({
+            title: "Acción Deshecha",
+            description: "Se ha revertido la última acción.",
+        });
+    }
+  };
+
+  const handleToolSelect = (tool: DrawingMode | 'project' | null) => {
+    cancelDrawing();
+    
+    if (tool === 'project') {
+      handleOpenProjectDialog();
+      setDrawingMode(null);
+    } else if (tool === 'clean') {
+      setIsCleanConfirmDialogOpen(true);
+      setDrawingMode(null);
+    } else if (tool === 'undo') {
+      handleUndo();
+      setDrawingMode(null);
+    } else if (tool === 'reservoir' || tool === 'valve' || tool === 'pump' || tool === 'tank' || tool === 'wtp' || tool === 'well' || tool === 'intake' || tool === 'vertex' || tool === 'dual' || tool === 'mesh' || tool === 'delete-component' | 'delete-pipe' | 'delete-selection' | 'purge' | 'renumber' | 'move' | 'viewer') {
+        toast({
+            title: "Herramienta no implementada",
+            description: "Esta funcionalidad estará disponible en futuras versiones.",
+        });
+        setDrawingMode(null);
+    }
+    else {
+      setDrawingMode(prev => {
+        const newMode = prev === tool ? null : tool;
+        setHideNodeTooltips(newMode === 'pipe');
+        if (newMode === null) {
+            cancelDrawing();
+        } else {
+            if (drawingPipeState.startNode) {
+                mapRef.current?.highlightNode(drawingPipeState.startNode.id, false);
+                setDrawingPipeState({ startNode: null });
+                mapRef.current?.stopGuideLine();
+            }
+        }
+        return newMode;
+      });
+    }
+  };
+
+  const handleImportKmlClick = () => {
+    importKmlInputRef.current?.click();
+  };
+
+  const handleImportKmlSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    toast({
+      title: 'Importando archivo...',
+      description: `Procesando ${file.name}.`,
+    });
+
+    try {
+      updateModel(() => initialModel);
+      await new Promise(resolve => setTimeout(resolve, 50)); 
+
+      const { nodes: importedNodes, pipes: importedPipes } = await processKmlFile(file);
+      
+      updateModel(current => ({
+        ...current,
+        nodes: importedNodes,
+        pipes: importedPipes,
+      }));
+
+      toast({
+        title: 'Importación Exitosa',
+        description: `Se importaron ${importedNodes.length} nudos y ${importedPipes.length} tuberías.`,
+      });
+
+      if (!projectData) {
+         setProjectData({
+            nombre: file.name.replace(/\.(kmz|kml)$/i, ''),
+         });
+      }
+
+      if (importedNodes.length > 0) {
+        const firstNode = importedNodes[0];
+        const newCenter: LatLngExpression = [firstNode.latitud, firstNode.longitud];
+        setMapCenter(newCenter);
+        setMapZoom(16);
+        mapRef.current?.setView(newCenter, 16);
+      }
+
+    } catch (error) {
+      console.error('Error importing KML/KMZ:', error);
+      toast({
+        title: 'Error de Importación',
+        description: (error as Error).message || 'No se pudo procesar el archivo.',
+        variant: 'destructive',
+      });
+    } finally {
+      if (event.target) {
+        event.target.value = '';
+      }
+    }
+  };
+
+  const handleCsvImport = ({ file, options }: { file: File, options: Record<string, boolean>}) => {
+      setIsCsvImportDialogOpen(false);
+      toast({
+          title: "Importando archivo CSV...",
+          description: `Procesando ${file.name}.`,
+      });
+
+      Papa.parse(file, {
+          header: true,
+          skipEmptyLines: true,
+          transformHeader: header => header.trim().toLowerCase(),
+          complete: (results) => {
+              if (results.errors.length) {
+                  const firstError = results.errors[0];
+                  toast({ title: "Error de Análisis CSV", description: `Error en la fila ${firstError.row}: ${firstError.message}`, variant: "destructive" });
+                  return;
+              }
+              
+              let importedNodes: Node[] = [];
+              if (options.nodes) {
+                  const findHeader = (aliases: string[]) => {
+                      return results.meta.fields?.find(h => aliases.includes(h.toLowerCase()));
+                  }
+
+                  const idHeader = findHeader(['id', 'ids']);
+                  const latHeader = findHeader(['lat', 'latitud']);
+                  const lngHeader = findHeader(['lng', 'lon', 'longitud']);
+                  const elevHeader = findHeader(['elevation', 'elevacion', 'cota', 'cotaterreno']);
+
+                  if (!latHeader || !lngHeader) {
+                      toast({ title: "Faltan columnas requeridas", description: "El archivo CSV debe contener cabeceras para latitud (ej: 'lat') y longitud (ej: 'lng').", variant: "destructive"});
+                      return;
+                  }
+
+                  const existingNodeIds = new Set(model.nodes.map(n => n.id));
+                  let nextNodeIdCounter = (model.nodes.length > 0 ? Math.max(...model.nodes.map(n => parseInt(n.id.substring(1)) || 0)) : 0) + 1;
+                  
+                  importedNodes = (results.data as any[]).map((row: any, index: number) => {
+                      const lat = parseFloat(row[latHeader]);
+                      const lng = parseFloat(row[lngHeader]);
+
+                      if (isNaN(lat) || isNaN(lng)) {
+                          console.warn(`Saltando fila ${index + 2} por coordenadas inválidas.`);
+                          return null;
+                      }
+
+                      let id = idHeader && row[idHeader] ? String(row[idHeader]).trim() : '';
+                      if (!id || existingNodeIds.has(id)) {
+                          id = `N${nextNodeIdCounter++}`;
+                      }
+                      
+                      const cota = elevHeader && row[elevHeader] ? parseFloat(row[elevHeader]) : null;
+
+                      return {
+                          id,
+                          latitud: lat,
+                          longitud: lng,
+                          cotaTerreno: cota && !isNaN(cota) ? cota : null,
+                          type: 'node',
+                      };
+                  }).filter((node): node is Node => node !== null && !existingNodeIds.has(node.id));
+              }
+
+              if (importedNodes.length > 0) {
+                  updateModel((current) => ({
+                      ...current,
+                      nodes: [...current.nodes, ...importedNodes],
+                  }));
+
+                  toast({
+                      title: "Importación CSV Exitosa",
+                      description: `Se importaron ${importedNodes.length} nuevos elementos.`
+                  });
+
+                  if (importedNodes.length > 0 && model.nodes.length === 0) {
+                      const firstNode = importedNodes[0];
+                      const newCenter: LatLngExpression = [firstNode.latitud, firstNode.longitud];
+                      setMapCenter(newCenter);
+                      setMapZoom(16);
+                      mapRef.current?.setView(newCenter, 16);
+                  }
+              } else {
+                  toast({
+                      title: "Importación CSV",
+                      description: "No se encontraron nuevos elementos para importar en el archivo o el tipo de componente no fue seleccionado.",
+                      variant: "destructive",
+                  });
+              }
+          },
+          error: (error: Error) => {
+             console.error('Error importing CSV:', error);
+              toast({
+                  title: 'Error de Importación CSV',
+                  description: error.message || 'No se pudo procesar el archivo.',
+                  variant: 'destructive',
+              });
+          }
+      });
+  };
+
+  const getProjectInitials = (name?: string): string => {
+    if (!name) return 'PROY';
+    return name.split(' ').map(word => word.charAt(0)).join('').toUpperCase() || 'PROY';
+  }
+
+  const handleExecuteExport = async (options: { nodes: boolean; pipes: boolean }) => {
+    setIsCsvExportDialogOpen(false);
+    
+    if (!options.nodes && !options.pipes) {
+        toast({
+            title: "Exportación Cancelada",
+            description: "No se seleccionó ningún tipo de componente para exportar.",
+            variant: "destructive",
+        });
+        return;
+    }
+
+    const projectInitials = getProjectInitials(projectData?.nombre);
+
+    const zip = new JSZip();
+    let filesGenerated = 0;
+
+    if (options.nodes && nodes.length > 0) {
+        const nodeData = nodes.map(n => ({
+            id: n.id,
+            lat: n.latitud,
+            lng: n.longitud,
+            cotaTerreno: n.cotaTerreno ?? ''
+        }));
+        const csvContent = Papa.unparse(nodeData, { header: true });
+        
+        if (options.pipes && pipes.length > 0) {
+            zip.file(`Nudos_${projectInitials}.csv`, csvContent);
+        } else {
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            saveAs(blob, `Nudos_${projectInitials}.csv`);
+        }
+        filesGenerated++;
+    }
+
+    if (options.pipes && pipes.length > 0) {
+        const distributionPipes = pipes.filter(p => p.type === 'distribution');
+        const pipeData = distributionPipes.map(p => ({
+            id: p.id,
+            startNodeId: p.startNodeId,
+            endNodeId: p.endNodeId,
+            length: p.length.toFixed(2),
+        }));
+        const csvContent = Papa.unparse(pipeData, { header: true });
+        
+        if (options.nodes && nodes.length > 0) {
+             zip.file(`Tuberias_${projectInitials}.csv`, csvContent);
+        } else {
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            saveAs(blob, `Tuberias_${projectInitials}.csv`);
+        }
+        filesGenerated++;
+    }
+
+    if (options.nodes && options.pipes && nodes.length > 0 && pipes.length > 0) {
+        try {
+            const zipBlob = await zip.generateAsync({ type: "blob" });
+            saveAs(zipBlob, `${projectInitials}_export.zip`);
+            toast({
+                title: "Exportación a ZIP Exitosa",
+                description: `Se han exportado nudos y tuberías a ${projectInitials}_export.zip.`
+            });
+        } catch (error) {
+             toast({
+                title: "Error al crear ZIP",
+                description: "No se pudo generar el archivo comprimido.",
+                variant: "destructive",
+            });
+        }
+        return;
+    }
+    
+    if (filesGenerated === 0) {
+         toast({
+            title: "No hay datos para exportar",
+            description: "No existen elementos de los tipos seleccionados en el modelo.",
+            variant: "destructive",
+        });
+        return;
+    }
+    
+    toast({
+        title: "Exportación a CSV Exitosa",
+        description: `Se ha exportado el archivo seleccionado.`
+    });
+  };
+
+  const handleExportToKml = () => {
+    if (!projectData) {
+      toast({
+        title: "No hay proyecto para exportar",
+        description: "Crea o abre un proyecto primero.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (nodes.length === 0 && pipes.length === 0) {
+      toast({
+        title: "No hay datos para exportar",
+        description: "El modelo está vacío.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    try {
+        const kmlContent = generateKml(nodes, pipes, projectData.nombre || 'HydroBIM Project');
+        const blob = new Blob([kmlContent], { type: 'application/vnd.google-earth.kml+xml;charset=utf-8' });
+        const fileName = `${projectData.nombre.replace(/\s+/g, '_') || 'hydrobim-project'}.kml`;
+        saveAs(blob, fileName);
+
+        toast({
+          title: "Exportación a KML Exitosa",
+          description: `Se ha exportado el proyecto a ${fileName}.`
+        });
+    } catch(error) {
+        console.error("Failed to generate KML:", error);
+        toast({
+            title: "Error al Exportar KML",
+            description: "No se pudo generar el archivo KML.",
+            variant: "destructive",
+        });
+    }
+  };
+
+  const handleExit = () => {
+    setIsExitConfirmDialogOpen(true);
+  };
+  
+  const handleOpenProjectClick = () => {
+    openProjectFileInputRef.current?.click();
+  };
+
+  const handleOpenProjectFile = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const text = e.target?.result;
+        if (typeof text !== 'string') {
+          throw new Error("Error al leer el archivo.");
+        }
+        const data = JSON.parse(text);
+
+        if (data.project && Array.isArray(data.history) && typeof data.historyIndex === 'number' && data.history.length > 0) {
+          setProjectData(data.project);
+          
+          const loadedHistory = data.history;
+          const loadedHistoryIndex = data.historyIndex;
+          setHistory(loadedHistory);
+          setHistoryIndex(loadedHistoryIndex);
+          setModel(loadedHistory[loadedHistoryIndex] || initialModel);
+          
+          if (data.project.latitud && data.project.longitud) {
+            const lat = parseFloat(data.project.latitud);
+            const lng = parseFloat(data.project.longitud);
+            if (!isNaN(lat) && !isNaN(lng)) {
+              const newCenter: LatLngExpression = [lat, lng];
+              setMapCenter(newCenter);
+              setMapZoom(15);
+              mapRef.current?.setView(newCenter, 15);
+            }
+          }
+          toast({
+            title: "Proyecto Abierto Exitosamente",
+            description: `Se ha cargado el proyecto "${data.project.nombre}".`,
+          });
+        } else {
+          throw new Error("El archivo no tiene el formato de proyecto HydroBIM válido.");
+        }
+      } catch (error) {
+        console.error("Failed to parse project file:", error);
+        toast({
+          title: "Error al Abrir Proyecto",
+          description: (error as Error).message || "El archivo está corrupto o no es válido.",
+          variant: "destructive",
+        });
+      } finally {
+         if (event.target) {
+            event.target.value = '';
+        }
+      }
+    };
+    reader.readAsText(file);
+  };
+
+
+  return (
+    <main className="flex flex-col h-screen">
+      <header className="flex h-14 items-center border-b px-4 flex-shrink-0 relative z-20 bg-background">
+        <h1 className="text-xl font-bold">HydroBIM</h1>
+        <Menubar className="ml-6 border-none shadow-none">
+          <MenubarMenu>
+            <MenubarTrigger>Archivo</MenubarTrigger>
+            <MenubarContent>
+              <MenubarItem onSelect={handleNewProject}>Nuevo</MenubarItem>
+              <MenubarItem onSelect={handleOpenProjectClick}>Abrir</MenubarItem>
+              <MenubarSeparator />
+              <MenubarItem onSelect={handleSave}>Guardar</MenubarItem>
+              <MenubarItem onSelect={handleOpenSaveAsDialog}>Guardar Como</MenubarItem>
+              <MenubarSeparator />
+              <MenubarSub>
+                <MenubarSubTrigger>Importar</MenubarSubTrigger>
+                <MenubarSubContent>
+                  <MenubarItem onSelect={handleImportKmlClick}>Archivos KMZ/KML</MenubarItem>
+                  <MenubarItem onSelect={() => setIsCsvImportDialogOpen(true)}>Archivos CSV</MenubarItem>
+                </MenubarSubContent>
+              </MenubarSub>
+              <MenubarSub>
+                <MenubarSubTrigger>Exportar</MenubarSubTrigger>
+                <MenubarSubContent>
+                  <MenubarItem onSelect={handleExportToKml}>Archivos KML</MenubarItem>
+                  <MenubarItem onSelect={() => setIsCsvExportDialogOpen(true)}>Archivos CSV</MenubarItem>
+                </MenubarSubContent>
+              </MenubarSub>
+              <MenubarSeparator />
+              <MenubarItem onSelect={handleExit}>Salir</MenubarItem>
+            </MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Datos</MenubarTrigger>
+            <MenubarContent>
+              <MenubarItem onSelect={handleOpenProjectDialog}>Proyecto</MenubarItem>
+              <MenubarItem>Parámetros de Diseño</MenubarItem>
+            </MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Mapa GIS</MenubarTrigger>
+            <MenubarContent>
+              <MenubarItem onSelect={() => setMapLayer('streets')}>Calles</MenubarItem>
+              <MenubarItem onSelect={() => setMapLayer('topo')}>Topografía</MenubarItem>
+              <MenubarItem onSelect={() => setMapLayer('satellite')}>Satelital</MenubarItem>
+              <MenubarItem onSelect={() => setMapLayer('neutral')}>Neutral</MenubarItem>
+            </MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Modelado</MenubarTrigger>
+            <MenubarContent>
+              <MenubarItem onSelect={toggleModelingToolbar}>Herramienta de Modelado</MenubarItem>
+              <MenubarItem>Topografía</MenubarItem>
+            </MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Sistema o Red</MenubarTrigger>
+            <MenubarContent>
+              <MenubarSub>
+                <MenubarSubTrigger>Datos del Modelado</MenubarSubTrigger>
+                <MenubarSubContent>
+                  <MenubarItem onSelect={() => setIsNodesDialogOpen(true)}>Nudos</MenubarItem>
+                  <MenubarItem>Vértices</MenubarItem>
+                  <MenubarItem onSelect={() => setIsPipesDialogOpen(true)}>Tuberías de Distribución</MenubarItem>
+                  <MenubarItem>Tuberías de Aducción</MenubarItem>
+                  <MenubarItem>Tuberías de Conducción</MenubarItem>
+                  <MenubarItem>Reservorios</MenubarItem>
+                  <MenubarItem>PTAPs</MenubarItem>
+                  <MenubarItem>Bocatomas</MenubarItem>
+                </MenubarSubContent>
+              </MenubarSub>
+            </MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Simulación</MenubarTrigger>
+            <MenubarContent></MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Configuración</MenubarTrigger>
+            <MenubarContent></MenubarContent>
+          </MenubarMenu>
+          <MenubarMenu>
+            <MenubarTrigger>Ayuda</MenubarTrigger>
+            <MenubarContent>
+              <MenubarItem onSelect={handleOpenScopesDialog}>
+                Alcances del Aplicativo
+              </MenubarItem>
+              <MenubarItem onSelect={handleOpenStatusDialog}>
+                Estado de Funcionalidad
+              </MenubarItem>
+            </MenubarContent>
+          </MenubarMenu>
+        </Menubar>
+      </header>
+      <div className="flex-grow relative z-10">
+        <input
+            type="file"
+            accept=".kml,.kmz"
+            style={{ display: 'none' }}
+            ref={importKmlInputRef}
+            onChange={handleImportKmlSelected}
+        />
+        <input
+            type="file"
+            accept=".json"
+            style={{ display: 'none' }}
+            ref={openProjectFileInputRef}
+            onChange={handleOpenProjectFile}
+        />
+        <MapComponent 
+          ref={mapRef} 
+          onMapClick={handleMapClick} 
+          drawingMode={drawingMode}
+          initialCenter={mapCenter}
+          initialZoom={mapZoom}
+          nodes={nodes}
+          pipes={pipes}
+          hideNodeTooltips={hideNodeTooltips}
+        />
+        {showModelingToolbar && <ModelingToolbar onToolSelect={handleToolSelect} activeTool={drawingMode} canUndo={historyIndex > 0} />}
+        <div className="absolute bottom-4 left-4 z-[999] p-2 bg-background/80 backdrop-blur-sm rounded-md shadow-md text-xs">
+            <div>Autor: Ing. Rulli Llancari Anyaipoma</div>
+            <div>BIM Proyectos Integrados SAC</div>
+        </div>
+      </div>
+      <ProjectDialog 
+        isOpen={isProjectDialogOpen} 
+        onOpenChange={setIsProjectDialogOpen}
+        onSave={handleSaveProjectDialog}
+        initialData={projectData}
+      />
+       <SaveAsDialog
+        isOpen={isSaveAsDialogOpen}
+        onOpenChange={setIsSaveAsDialogOpen}
+        onSave={executeSaveAs}
+        defaultFileName={projectData?.nombre.replace(/\s+/g, '_') || 'hydrobim-project'}
+      />
+      <StatusDialog 
+        isOpen={isStatusDialogOpen}
+        onOpenChange={setIsStatusDialogOpen}
+      />
+      <ScopesDialog
+        isOpen={isScopesDialogOpen}
+        onOpenChange={setIsScopesDialogOpen}
+      />
+      <NodesDialog
+        isOpen={isNodesDialogOpen}
+        onOpenChange={setIsNodesDialogOpen}
+        nodes={nodes}
+      />
+       <PipesDialog
+        isOpen={isPipesDialogOpen}
+        onOpenChange={setIsPipesDialogOpen}
+        pipes={pipes.filter(p => p.type === 'distribution')}
+      />
+       <AlertDialog open={isCleanConfirmDialogOpen} onOpenChange={setIsCleanConfirmDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>¿Está seguro que desea limpiar el lienzo?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Esta acción borrará permanentemente todos los componentes del modelo hidráulico (nudos y tuberías). No podrá deshacer esta acción.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancelar</AlertDialogCancel>
+            <AlertDialogAction onClick={() => {
+              handleClean();
+              setIsCleanConfirmDialogOpen(false);
+            }}>
+              Limpiar
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog open={isExitConfirmDialogOpen} onOpenChange={setIsExitConfirmDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>¿Está seguro de que desea salir?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Asegúrese de haber guardado su proyecto antes de salir. Los cambios no guardados se perderán.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancelar</AlertDialogCancel>
+            <AlertDialogAction onClick={() => window.close()}>
+              Salir de todas formas
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <CsvImportDialog
+        isOpen={isCsvImportDialogOpen}
+        onOpenChange={setIsCsvImportDialogOpen}
+        onImport={handleCsvImport}
+      />
+      <CsvExportDialog
+        isOpen={isCsvExportDialogOpen}
+        onOpenChange={setIsCsvExportDialogOpen}
+        onExport={handleExecuteExport}
+        hasNodes={nodes.length > 0}
+        hasPipes={pipes.filter(p => p.type === 'distribution').length > 0}
+      />
+    </main>
+  );
+}
