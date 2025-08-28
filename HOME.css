@@ -22,9 +22,9 @@ import { useToast } from '@/hooks/use-toast';
 import StatusDialog from '@/components/StatusDialog';
 import NodesDialog from '@/components/NodesDialog';
 import PipesDialog from '@/components/PipesDialog';
-import type { Node, Pipe } from '@/types/hydro';
-import type { LatLng, LatLngExpression } from 'leaflet';
-import { getElevation } from '../app/actions';
+import type { Node, Pipe, Vertex, Reservoir, Connectable, PTAP, Bocatoma, Captacion, PozoProfundo, TanqueElevado, HydroModel } from '@/types/hydro';
+import type { LatLng, LatLngBounds, LatLngExpression } from 'leaflet';
+import { getElevation } from '@/app/actions';
 import { saveAs } from 'file-saver';
 import SaveAsDialog from './SaveAsDialog';
 import ScopesDialog from './ScopesDialog';
@@ -39,18 +39,18 @@ import MeshControlCard from './MeshControlCard';
 import type { MeshParams } from './MeshControlCard';
 import MeasureControlCard from './MeasureControlCard';
 import type { MeasureUnit } from './MeasureControlCard';
+import { isPointInPolygon } from '@/lib/geometry';
+import VerticesDialog from './VerticesDialog';
+import ReservoirsDialog from './ReservoirsDialog';
+import PTAPsDialog from './PTAPsDialog';
+import BocatomasDialog from './BocatomasDialog';
+import CaptacionesDialog from './CaptacionesDialog';
+import PozosProfundosDialog from './PozosProfundosDialog';
+import TanquesElevadosDialog from './TanquesElevadosDialog';
 
+const MapComponent = dynamic(() => import('@/components/Map'), { ssr: false });
 
-const MapComponent = dynamic(() => import('@/components/Map'), {
-  ssr: false,
-});
-
-type DrawingMode = 'node' | 'pipe' | 'reservoir' | 'valve' | 'pump' | 'tank' | 'wtp' | 'well' | 'intake' | 'vertex' | 'dual' | 'mesh' | 'delete-component' | 'measure' | 'delete-selection' | 'clean' | 'purge' | 'renumber' | 'move' | 'viewer' | 'undo';
-
-export type HydroModel = {
-  nodes: Node[];
-  pipes: Pipe[];
-};
+type DrawingMode = 'node' | 'pipe' | 'reservoir' | 'valve-purge' | 'valve-air' | 'valve-control' | 'pump' | 'tank' | 'wtp' | 'well' | 'intake' | 'captation' | 'vertex' | 'dual' | 'mesh' | 'delete-component' | 'measure' | 'delete-selection' | 'clean' | 'purge' | 'renumber' | 'move' | 'viewer' | 'undo' | 'chamber-pumping' | 'chamber-junction' | 'chamber-pressure-break';
 
 type MeshState = {
     status: 'configuring' | 'settingStart' | 'settingEnd';
@@ -66,7 +66,24 @@ type MeasureState = {
 }
 
 
-const initialModel: HydroModel = { nodes: [], pipes: [] };
+const initialModel: HydroModel = {
+  nodes: [
+    { id: 'N1', latitud: -12.045, longitud: -77.040, cotaTerreno: 150, type: 'node' },
+    { id: 'N2', latitud: -12.050, longitud: -77.045, cotaTerreno: 155, type: 'node' },
+    { id: 'N3', latitud: -12.045, longitud: -77.050, cotaTerreno: 160, type: 'node' },
+  ],
+  pipes: [
+    { id: 'T-1', startNodeId: 'N1', endNodeId: 'N2', length: 780, type: 'distribution', vertexIds: [] },
+    { id: 'T-2', startNodeId: 'N2', endNodeId: 'N3', length: 555, type: 'distribution', vertexIds: [] },
+  ],
+  vertices: [],
+  reservoirs: [],
+  ptaps: [],
+  bocatomas: [],
+  captaciones: [],
+  pozosProfundos: [],
+  tanquesElevados: []
+};
 
 
 export default function Home() {
@@ -79,6 +96,13 @@ export default function Home() {
   const [isScopesDialogOpen, setIsScopesDialogOpen] = useState(false);
   const [isNodesDialogOpen, setIsNodesDialogOpen] = useState(false);
   const [isPipesDialogOpen, setIsPipesDialogOpen] = useState(false);
+  const [isVerticesDialogOpen, setIsVerticesDialogOpen] = useState(false);
+  const [isReservoirsDialogOpen, setIsReservoirsDialogOpen] = useState(false);
+  const [isPtapsDialogOpen, setIsPtapsDialogOpen] = useState(false);
+  const [isBocatomasDialogOpen, setIsBocatomasDialogOpen] = useState(false);
+  const [isCaptacionesDialogOpen, setIsCaptacionesDialogOpen] = useState(false);
+  const [isPozosProfundosDialogOpen, setIsPozosProfundosDialogOpen] = useState(false);
+  const [isTanquesElevadosDialogOpen, setIsTanquesElevadosDialogOpen] = useState(false);
   const [isSaveAsDialogOpen, setIsSaveAsDialogOpen] = useState(false);
   const [isCleanConfirmDialogOpen, setIsCleanConfirmDialogOpen] = useState(false);
   const [isRenumberConfirmDialogOpen, setIsRenumberConfirmDialogOpen] = useState(false);
@@ -89,7 +113,7 @@ export default function Home() {
 
   const [projectData, setProjectData] = useState<ProjectData | null>(null);
   const [drawingMode, setDrawingMode] = useState<DrawingMode | null>(null);
-  const [drawingPipeState, setDrawingPipeState] = useState<{ startNode: Node | null }>({ startNode: null });
+  const [drawingPipeState, setDrawingPipeState] = useState<{ startComponent: Connectable | null }>({ startComponent: null });
   const [hideNodeTooltips, setHideNodeTooltips] = useState(false);
 
   const [meshState, setMeshState] = useState<MeshState>({
@@ -104,6 +128,9 @@ export default function Home() {
     distance: null,
     unit: 'm'
   });
+
+  const [selectionPolygon, setSelectionPolygon] = useState<LatLng[]>([]);
+  const [viewerBoxPoints, setViewerBoxPoints] = useState<LatLng[]>([]);
   
   const { toast } = useToast();
 
@@ -114,7 +141,7 @@ export default function Home() {
   const [history, setHistory] = useState<HydroModel[]>([initialModel]);
   const [historyIndex, setHistoryIndex] = useState(0);
 
-  const { nodes, pipes } = model;
+  const { nodes, pipes, vertices, reservoirs, ptaps, bocatomas, captaciones, pozosProfundos, tanquesElevados } = model;
   
   const updateModel = useCallback((modelUpdater: (current: HydroModel) => HydroModel) => {
     setModel(prevModel => {
@@ -134,7 +161,18 @@ export default function Home() {
         if (parsedData.project && parsedData.model) {
           setProjectData(parsedData.project);
           
-          const loadedModel = parsedData.model;
+          const loadedModel: HydroModel = {
+            ...initialModel,
+            ...parsedData.model,
+            pipes: (parsedData.model.pipes || []).map((p: Pipe) => ({ ...p, vertexIds: p.vertexIds || [] })),
+            vertices: parsedData.model.vertices || [],
+            reservoirs: (parsedData.model.reservoirs || []).map((r: any) => ({ ...r, horasConsumo: r.horasConsumo || 0, horasLlenado: r.horasLlenado || 0, volumenReserva: r.volumenReserva || 0, volumenContraIncendio: r.volumenContraIncendio || 0 })),
+            ptaps: parsedData.model.ptaps || [],
+            bocatomas: parsedData.model.bocatomas || [],
+            captaciones: parsedData.model.captaciones || [],
+            pozosProfundos: parsedData.model.pozosProfundos || [],
+            tanquesElevados: parsedData.model.tanquesElevados || [],
+          };
           
           setModel(loadedModel);
           setHistory([loadedModel]);
@@ -178,11 +216,60 @@ export default function Home() {
     }
   }, [toast]);
 
-  const cancelDrawing = useCallback(() => {
-    if (drawingPipeState.startNode) {
-      mapRef.current?.highlightNode(drawingPipeState.startNode.id, false);
+  const handleDeleteSelection = useCallback(() => {
+    if (selectionPolygon.length < 3) {
+      toast({
+        title: "Selección Inválida",
+        description: "Debe seleccionar al menos 3 puntos para formar un polígono.",
+        variant: "destructive"
+      });
+      setSelectionPolygon([]);
+      return;
     }
-    setDrawingPipeState({ startNode: null });
+
+    updateModel(current => {
+      const nodesToDelete = new Set<string>();
+      
+      current.nodes.forEach(node => {
+        if (isPointInPolygon({ lat: node.latitud, lng: node.longitud }, selectionPolygon)) {
+          nodesToDelete.add(node.id);
+        }
+      });
+  
+      if (nodesToDelete.size === 0) {
+        toast({ title: "Sin Resultados", description: "Ningún nudo encontrado dentro de la selección." });
+        setSelectionPolygon([]);
+        setDrawingMode(null);
+        return current;
+      }
+
+      const newNodes = current.nodes.filter(n => !nodesToDelete.has(n.id));
+      
+      const newPipes = current.pipes.filter(p => 
+        !nodesToDelete.has(p.startNodeId) && !nodesToDelete.has(p.endNodeId)
+      );
+
+      const nodesDeletedCount = current.nodes.length - newNodes.length;
+      const pipesDeletedCount = current.pipes.length - newPipes.length;
+      
+      toast({
+        title: "Selección Eliminada",
+        description: `Se eliminaron ${nodesDeletedCount} nudos y ${pipesDeletedCount} tuberías.`
+      });
+
+      return { ...current, nodes: newNodes, pipes: newPipes };
+    });
+
+    setSelectionPolygon([]);
+    setDrawingMode(null);
+  }, [selectionPolygon, updateModel, toast]);
+
+  const cancelDrawing = useCallback(() => {
+    if (drawingPipeState.startComponent) {
+      mapRef.current?.highlightNode(drawingPipeState.startComponent.id, false);
+      setDrawingPipeState({ startComponent: null });
+    }
+    setDrawingPipeState({ startComponent: null });
     setDrawingMode(null);
     mapRef.current?.stopGuideLine();
 
@@ -196,17 +283,23 @@ export default function Home() {
     if (drawingMode === 'measure') {
         handleMeasureExit();
     }
+    if (drawingMode === 'delete-selection') {
+      setSelectionPolygon([]);
+    }
+    if (drawingMode === 'viewer') {
+        setViewerBoxPoints([]);
+    }
 
-  }, [drawingMode, drawingPipeState.startNode]);
+  }, [drawingMode, drawingPipeState.startComponent]);
 
   const resetPipeDrawing = () => {
-    if (drawingPipeState.startNode) {
-        mapRef.current?.highlightNode(drawingPipeState.startNode.id, false);
-        setDrawingPipeState({ startNode: null });
+    if (drawingPipeState.startComponent) {
+        mapRef.current?.highlightNode(drawingPipeState.startComponent.id, false);
+        setDrawingPipeState({ startComponent: null });
         mapRef.current?.stopGuideLine();
         toast({
-            title: "Dibujo de Tubería Reiniciado",
-            description: "Seleccione un nuevo nudo de inicio.",
+            title: "Modelado de Tubería Reiniciado",
+            description: "Seleccione un nuevo componente de inicio.",
         });
     }
   }
@@ -218,13 +311,15 @@ export default function Home() {
             cancelDrawing();
             toast({
                 title: "Modelado Cancelado",
-                description: "Se ha salido del modo de dibujo.",
+                description: "Se ha salido del modo de modelado.",
             });
         }
       }
       if (event.key === 'Enter') {
-          if ((drawingMode === 'pipe' || drawingMode === 'dual') && drawingPipeState.startNode) {
+          if ((drawingMode === 'pipe' || drawingMode === 'dual') && drawingPipeState.startComponent) {
               resetPipeDrawing();
+          } else if (drawingMode === 'delete-selection' && selectionPolygon.length > 0) {
+            handleDeleteSelection();
           }
       }
     };
@@ -234,7 +329,7 @@ export default function Home() {
     return () => {
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [drawingMode, drawingPipeState.startNode, cancelDrawing]);
+  }, [drawingMode, drawingPipeState.startComponent, cancelDrawing, selectionPolygon, handleDeleteSelection]);
 
   const setMapLayer = (layer: 'streets' | 'topo' | 'satellite' | 'neutral') => {
     mapRef.current?.setLayer(layer);
@@ -276,14 +371,12 @@ export default function Home() {
     }, 100);
   }, [updateModel, toast]);
   
-  const createNewPipe = (startNode: Node, endNode: Node, currentPipes: Pipe[]): Pipe => {
-      const startLatLng = { lat: startNode.latitud, lng: startNode.longitud };
-      const endLatLng = { lat: endNode.latitud, lng: endNode.longitud };
+  const createNewPipe = (startComponent: Connectable, endComponent: Connectable, currentPipes: Pipe[]): Pipe => {
       const R = 6371e3; // metres
-      const φ1 = startLatLng.lat * Math.PI/180;
-      const φ2 = endLatLng.lat * Math.PI/180;
-      const Δφ = (endLatLng.lat-startLatLng.lat) * Math.PI/180;
-      const Δλ = (endLatLng.lng-startLatLng.lng) * Math.PI/180;
+      const φ1 = startComponent.latitud * Math.PI/180;
+      const φ2 = endComponent.latitud * Math.PI/180;
+      const Δφ = (endComponent.latitud-startComponent.latitud) * Math.PI/180;
+      const Δλ = (endComponent.longitud-startComponent.longitud) * Math.PI/180;
       const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
                 Math.cos(φ1) * Math.cos(φ2) *
                 Math.sin(Δλ/2) * Math.sin(Δλ/2);
@@ -295,16 +388,19 @@ export default function Home() {
       
       const newPipe: Pipe = {
         id: newPipeId,
-        startNodeId: startNode.id,
-        endNodeId: endNode.id,
+        startNodeId: startComponent.id,
+        endNodeId: endComponent.id,
         length: length,
         type: 'distribution',
+        vertexIds: [],
       };
 
-      toast({
-        title: "Tubería Creada",
-        description: `Se ha creado la tubería ${newPipe.id} entre ${startNode.id} y ${endNode.id} con una longitud de ${length.toFixed(2)}m.`
-      });
+      setTimeout(() => {
+        toast({
+          title: "Tubería Creada",
+          description: `Se ha creado la tubería ${newPipe.id} entre ${startComponent.id} y ${endComponent.id} con una longitud de ${length.toFixed(2)}m.`
+        });
+      }, 0);
 
       return newPipe;
   };
@@ -322,32 +418,35 @@ export default function Home() {
     const newNodes: Node[] = [];
     const newPipes: Pipe[] = [];
     
-    // Create a 2D array to store the generated nodes
     const nodeGrid: (Node | null)[][] = Array.from({ length: numVertical }, () => Array(numHorizontal).fill(null));
-
+    
     const latDegPerMeter = 1 / 111132.954;
     const lonDegPerMeterAtLat = (lat: number) => 1 / (111320 * Math.cos(lat * Math.PI / 180));
+    
+    const baseVectorLat = endPoint.lat - startPoint.lat;
+    const baseVectorLng = endPoint.lng - startPoint.lng;
+    const baseVectorMag = Math.sqrt(baseVectorLat**2 + baseVectorLng**2);
+
+    const unitVectorLat = baseVectorMag > 0 ? baseVectorLat / baseVectorMag : 0;
+    const unitVectorLng = baseVectorMag > 0 ? baseVectorLng / baseVectorMag : 0;
+    
+    // Perpendicular vector (anti-clockwise)
+    const perpUnitVectorLat = -unitVectorLng;
+    const perpUnitVectorLng = unitVectorLat;
+    
+    const dx_h = unitVectorLng * distance * lonDegPerMeterAtLat(startPoint.lat);
+    const dy_h = unitVectorLat * distance * latDegPerMeter;
+    const dx_v = perpUnitVectorLng * distance * lonDegPerMeterAtLat(startPoint.lat);
+    const dy_v = perpUnitVectorLat * distance * latDegPerMeter;
+
 
     let nextNodeIdCounter = (currentModel.nodes.length > 0 ? Math.max(...currentModel.nodes.map(n => parseInt(n.id.substring(1)) || 0)) : 0) + 1;
     
-    const deltaLat = endPoint.lat - startPoint.lat;
-    const deltaLng = endPoint.lng - startPoint.lng;
-    const angle = Math.atan2(deltaLng, deltaLat);
-
-    const cosAngle = Math.cos(angle);
-    const sinAngle = Math.sin(angle);
-
     for (let i = 0; i < numVertical; i++) {
         for (let j = 0; j < numHorizontal; j++) {
             
-            const localX = j * distance;
-            const localY = i * distance;
-            
-            const rotatedX = localX * cosAngle - localY * sinAngle;
-            const rotatedY = localX * sinAngle + localY * cosAngle;
-
-            const newLat = startPoint.lat + rotatedY * latDegPerMeter;
-            const newLng = startPoint.lng + rotatedX * lonDegPerMeterAtLat(startPoint.lat);
+            const newLng = startPoint.lng + j * dx_h + i * dx_v;
+            const newLat = startPoint.lat + j * dy_h + i * dy_v;
             
             const elevation = await getElevation(newLat, newLng);
             
@@ -365,7 +464,6 @@ export default function Home() {
     
     let nextPipeIdCounter = (currentModel.pipes.length > 0 ? Math.max(...currentModel.pipes.map(p => parseInt(p.id.substring(2)) || 0)) : 0) + 1;
 
-    // Create horizontal pipes
     for (let i = 0; i < numVertical; i++) {
         for (let j = 0; j < numHorizontal - 1; j++) {
             const startNode = nodeGrid[i][j];
@@ -376,13 +474,13 @@ export default function Home() {
                     startNodeId: startNode.id,
                     endNodeId: endNode.id,
                     length: distance,
-                    type: 'distribution'
+                    type: 'distribution',
+                    vertexIds: [],
                 });
             }
         }
     }
 
-    // Create vertical pipes
     for (let i = 0; i < numVertical - 1; i++) {
         for (let j = 0; j < numHorizontal; j++) {
              const startNode = nodeGrid[i][j];
@@ -393,13 +491,15 @@ export default function Home() {
                     startNodeId: startNode.id,
                     endNodeId: endNode.id,
                     length: distance,
-                    type: 'distribution'
+                    type: 'distribution',
+                    vertexIds: [],
                 });
              }
         }
     }
 
     updateModel(current => ({
+        ...current,
         nodes: [...current.nodes, ...newNodes],
         pipes: [...current.pipes, ...newPipes]
     }));
@@ -407,108 +507,411 @@ export default function Home() {
     toast({ title: "Malla Generada", description: `Se crearon ${newNodes.length} nudos y ${newPipes.length} tuberías.` });
 };
 
+const handleInsertVertex = async (pipeId: string, latlng: LatLng) => {
+    toast({ title: "Insertando vértice...", description: "Obteniendo cota del terreno." });
+    const elevation = await getElevation(latlng.lat, latlng.lng);
 
-  const handleMapClick = async (latlng: LatLng, clickedNode: Node | null, clickedPipe: Pipe | null) => {
-    const createNewNode = async (latlng: LatLng, currentModel: HydroModel): Promise<Node | null> => {
-        toast({ title: "Obteniendo cota del terreno...", description: "Por favor espere." });
-        const elevation = await getElevation(latlng.lat, latlng.lng);
+    updateModel(current => {
+        const nextVertexIdCounter = (current.vertices.length > 0 ? Math.max(...current.vertices.map(v => parseInt(v.id.substring(2)) || 0)) : 0) + 1;
+        const newVertexId = `Vd${nextVertexIdCounter}`;
         
-        if (elevation === null) {
-            toast({ title: "Error al obtener la cota", description: "No se pudo obtener la cota del terreno para este punto. Inténtelo de nuevo.", variant: "destructive" });
-            return null;
-        }
+        const newVertex: Vertex = {
+            id: newVertexId,
+            latitud: latlng.lat,
+            longitud: latlng.lng,
+            cotaTerreno: elevation,
+        };
 
-        const nextNodeId = (currentModel.nodes.length > 0 ? Math.max(...currentModel.nodes.map(n => parseInt(n.id.substring(1)) || 0)) : 0) + 1;
-        const newId = `N${nextNodeId}`;
-        const newNode: Node = {
+        const newPipes = current.pipes.map(pipe => {
+            if (pipe.id === pipeId) {
+                const newVertexIds = [...(pipe.vertexIds || []), newVertex.id];
+
+                const allConnectables: (Connectable)[] = [...current.nodes, ...current.reservoirs];
+                const startNode = allConnectables.find(c => c.id === pipe.startNodeId);
+                const endNode = allConnectables.find(c => c.id === pipe.endNodeId);
+                if (!startNode || !endNode) return pipe;
+                
+                const allPipeVerticesWithNew = [...(pipe.vertexIds || [])
+                    .map(vId => current.vertices.find(v => v.id === vId))
+                    .filter((v): v is Vertex => !!v), newVertex];
+
+
+                const allPoints = [
+                    { lat: startNode.latitud, lng: startNode.longitud },
+                    ...allPipeVerticesWithNew.map(v => ({ lat: v.latitud, lng: v.longitud })),
+                    { lat: endNode.latitud, lng: endNode.longitud }
+                ];
+                
+                let newLength = 0;
+                for (let i = 0; i < allPoints.length - 1; i++) {
+                    newLength += mapRef.current?.calculateDistance(
+                        [allPoints[i].lat, allPoints[i].lng],
+                        [allPoints[i + 1].lat, allPoints[i + 1].lng]
+                    ) || 0;
+                }
+
+                toast({
+                    title: "Vértice Agregado",
+                    description: `Se agregó el vértice ${newVertex.id} a la tubería ${pipe.id}. Nueva longitud: ${newLength.toFixed(2)}m.`
+                });
+
+                return { ...pipe, vertexIds: newVertexIds, length: newLength };
+            }
+            return pipe;
+        });
+
+        return {
+            ...current,
+            vertices: [...current.vertices, newVertex],
+            pipes: newPipes
+        };
+    });
+};
+
+const handlePipeSplit = async (pipe: Pipe, latlng: LatLng) => {
+    const allConnectablesBeforeInsert: Connectable[] = [...model.nodes, ...model.reservoirs, ...model.ptaps, ...model.bocatomas, ...model.captaciones, ...model.pozosProfundos, ...model.tanquesElevados];
+    const startComponent = allConnectablesBeforeInsert.find(c => c.id === pipe.startNodeId);
+    const endComponent = allConnectablesBeforeInsert.find(c => c.id === pipe.endNodeId);
+    
+    if (!startComponent || !endComponent) return;
+    
+    const newLength1 = mapRef.current?.calculateDistance(
+        [startComponent.latitud, startComponent.longitud],
+        [latlng.lat, latlng.lng]
+    ) || 0;
+    
+    const newLength2 = mapRef.current?.calculateDistance(
+        [latlng.lat, latlng.lng],
+        [endComponent.latitud, endComponent.longitud]
+    ) || 0;
+
+    const MIN_PIPE_LENGTH = 2.5;
+    if (newLength1 < MIN_PIPE_LENGTH || newLength2 < MIN_PIPE_LENGTH) {
+        toast({
+            title: "División de Tubería Cancelada",
+            description: `La tubería no se puede dividir aquí porque crearía un tramo demasiado corto (menor a ${MIN_PIPE_LENGTH}m).`,
+            variant: "destructive",
+        });
+        return;
+    }
+
+    const insertedNode = await createNewNode(latlng, model);
+    if (!insertedNode) return;
+
+    updateModel(current => {
+        const nextPipeNumber = (current.pipes.length > 0 ? Math.max(...current.pipes.map(p => parseInt(p.id.substring(2)) || 0)) : 0) + 1;
+        const newPipeId = `T-${nextPipeNumber}`;
+
+        // The original pipe is now the first segment
+        const modifiedPipe: Pipe = {
+            ...pipe,
+            endNodeId: insertedNode.id,
+            length: newLength1,
+            vertexIds: [], // Vertices are cleared on split
+        };
+
+        // The new pipe is the second segment
+        const newPipe: Pipe = {
+            id: newPipeId,
+            startNodeId: insertedNode.id,
+            endNodeId: endComponent.id,
+            length: newLength2,
+            type: pipe.type,
+            vertexIds: [], // Vertices are cleared on split
+        };
+       
+        toast({
+            title: "Tubería Dividida",
+            description: `La tubería ${pipe.id} ha sido dividida por el nudo ${insertedNode.id}. Se creó la tubería ${newPipe.id}.`,
+        });
+
+        const otherPipes = current.pipes.filter(p => p.id !== pipe.id);
+
+        return {
+            ...current,
+            nodes: [...current.nodes, insertedNode],
+            pipes: [...otherPipes, modifiedPipe, newPipe],
+        };
+    });
+};
+
+
+  const createNewNode = async (latlng: LatLng, currentModel: HydroModel): Promise<Node | null> => {
+      toast({ title: "Obteniendo cota del terreno...", description: "Por favor espere." });
+      const elevation = await getElevation(latlng.lat, latlng.lng);
+      
+      if (elevation === null) {
+          toast({ title: "Error al obtener la cota", description: "No se pudo obtener la cota del terreno para este punto. Inténtelo de nuevo.", variant: "destructive" });
+          return null;
+      }
+
+      const nextNodeId = (currentModel.nodes.length > 0 ? Math.max(...currentModel.nodes.map(n => parseInt(n.id.substring(1)) || 0)) : 0) + 1;
+      const newId = `N${nextNodeId}`;
+      const newNode: Node = {
+          id: newId,
+          latitud: latlng.lat,
+          longitud: latlng.lng,
+          cotaTerreno: elevation,
+          type: 'node',
+      };
+      toast({ title: "Nudo Creado", description: `Se ha creado el nudo ${newNode.id} con cota ${elevation.toFixed(2)}m.`});
+      return newNode;
+  };
+
+  const handleMapClick = async (latlng: LatLng, clickedComponent: Connectable | null, clickedPipe: Pipe | null, clickedVertex: Vertex | null) => {
+    
+    const createNewReservoir = async (latlng: LatLng, currentModel: HydroModel): Promise<Reservoir | null> => {
+        toast({ title: "Creando reservorio...", description: "Obteniendo cota del terreno." });
+        const elevation = await getElevation(latlng.lat, latlng.lng);
+
+        const nextReservoirId = (currentModel.reservoirs.length > 0 ? Math.max(...currentModel.reservoirs.map(r => parseInt(r.id.substring(1)) || 0)) : 0) + 1;
+        const newId = `R${nextReservoirId}`;
+
+        const newReservoir: Reservoir = {
+            id: newId,
+            latitud: latlng.lat,
+            longitud: latlng.lng,
+            cota: elevation,
+            volumen: 0,
+            caudalIngreso: 0,
+            caudalSalida: 0,
+            presionIngreso: 0,
+            presionSalida: 0,
+            horasConsumo: 0,
+            horasLlenado: 0,
+            volumenReserva: 0,
+            volumenContraIncendio: 0,
+        };
+        toast({ title: "Reservorio Creado", description: `Se ha creado el reservorio ${newReservoir.id} con cota ${elevation?.toFixed(2) ?? 'N/A'}m.` });
+        return newReservoir;
+    };
+
+    const createNewPTAP = async (latlng: LatLng, currentModel: HydroModel): Promise<PTAP | null> => {
+        toast({ title: "Creando PTAP...", description: "Obteniendo cota del terreno." });
+        const elevation = await getElevation(latlng.lat, latlng.lng);
+
+        const nextPTAPId = (currentModel.ptaps.length > 0 ? Math.max(...currentModel.ptaps.map(r => parseInt(r.id.substring(1)) || 0)) : 0) + 1;
+        const newId = `P${nextPTAPId}`;
+
+        const newPTAP: PTAP = {
+            id: newId,
+            latitud: latlng.lat,
+            longitud: latlng.lng,
+            cota: elevation,
+            evaporationOrLossPercentage: 0,
+            inflowRate: 0,
+            outflowRate: 0,
+            supplyHours: 0,
+            feedHours: 0,
+        };
+        toast({ title: "PTAP Creada", description: `Se ha creado la PTAP ${newPTAP.id} con cota ${elevation?.toFixed(2) ?? 'N/A'}m.` });
+        return newPTAP;
+    };
+
+    const createNewBocatoma = async (latlng: LatLng, currentModel: HydroModel): Promise<Bocatoma | null> => {
+        toast({ title: "Creando Bocatoma...", description: "Obteniendo cota del terreno." });
+        const elevation = await getElevation(latlng.lat, latlng.lng);
+
+        const nextBocatomaId = (currentModel.bocatomas.length > 0 ? Math.max(...currentModel.bocatomas.map(b => parseInt(b.id.substring(1)) || 0)) : 0) + 1;
+        const newId = `B${nextBocatomaId}`;
+
+        const newBocatoma: Bocatoma = {
+            id: newId,
+            latitud: latlng.lat,
+            longitud: latlng.lng,
+            cota: elevation,
+            caudalSalida: 0,
+            presionSalida: 0,
+        };
+        toast({ title: "Bocatoma Creada", description: `Se ha creado la bocatoma ${newBocatoma.id} con cota ${elevation?.toFixed(2) ?? 'N/A'}m.` });
+        return newBocatoma;
+    };
+
+    const createNewCaptacion = async (latlng: LatLng, currentModel: HydroModel): Promise<Captacion | null> => {
+        toast({ title: "Creando Captación...", description: "Obteniendo cota del terreno." });
+        const elevation = await getElevation(latlng.lat, latlng.lng);
+
+        const nextCaptacionId = (currentModel.captaciones.length > 0 ? Math.max(...currentModel.captaciones.map(c => parseInt(c.id.substring(1)) || 0)) : 0) + 1;
+        const newId = `C${nextCaptacionId}`;
+
+        const newCaptacion: Captacion = {
+            id: newId,
+            latitud: latlng.lat,
+            longitud: latlng.lng,
+            cota: elevation,
+            caudalSalida: 0,
+            presionSalida: 0,
+        };
+        toast({ title: "Captación Creada", description: `Se ha creado la captación ${newCaptacion.id} con cota ${elevation?.toFixed(2) ?? 'N/A'}m.` });
+        return newCaptacion;
+    };
+
+    const createNewPozoProfundo = async (latlng: LatLng, currentModel: HydroModel): Promise<PozoProfundo | null> => {
+        toast({ title: "Creando Pozo Profundo...", description: "Obteniendo cota del terreno." });
+        const elevation = await getElevation(latlng.lat, latlng.lng);
+
+        const nextPozoId = (currentModel.pozosProfundos.length > 0 ? Math.max(...currentModel.pozosProfundos.map(p => parseInt(p.id.substring(2)) || 0)) : 0) + 1;
+        const newId = `Pp${nextPozoId}`;
+
+        const newPozo: PozoProfundo = {
             id: newId,
             latitud: latlng.lat,
             longitud: latlng.lng,
             cotaTerreno: elevation,
-            type: 'node',
+            cotaSuccion: 0,
+            caudalSalida: 0,
+            horasSuccion: 0,
+            volumenRequerido: 0,
         };
-        toast({ title: "Nudo Creado", description: `Se ha creado el nudo ${newNode.id} con cota ${elevation.toFixed(2)}m.`});
-        return newNode;
+        toast({ title: "Pozo Profundo Creado", description: `Se ha creado el pozo ${newPozo.id} con cota ${elevation?.toFixed(2) ?? 'N/A'}m.` });
+        return newPozo;
     };
 
-    if (drawingMode === 'node' && !clickedNode) {
-        const newNode = await createNewNode(latlng, model);
-        if (newNode) {
-            updateModel(current => ({ ...current, nodes: [...current.nodes, newNode] }));
-        }
-    } else if (drawingMode === 'pipe' && clickedNode) {
-      if (!drawingPipeState.startNode) {
-        setDrawingPipeState({ startNode: clickedNode });
-        mapRef.current?.highlightNode(clickedNode.id, true);
-        mapRef.current?.startGuideLine([clickedNode.latitud, clickedNode.longitud]);
-      } else {
-        const startNode = drawingPipeState.startNode;
-        const endNode = clickedNode;
+    const createNewTanqueElevado = async (latlng: LatLng, currentModel: HydroModel): Promise<TanqueElevado | null> => {
+        toast({ title: "Creando Tanque Elevado...", description: "Obteniendo cota del terreno." });
+        const elevation = await getElevation(latlng.lat, latlng.lng);
 
-        if (startNode.id === endNode.id) return;
+        const nextIdCounter = (currentModel.tanquesElevados.length > 0 ? Math.max(...currentModel.tanquesElevados.map(p => parseInt(p.id.substring(2)) || 0)) : 0) + 1;
+        const newId = `Te${nextIdCounter}`;
+
+        const newTanque: TanqueElevado = {
+            id: newId,
+            latitud: latlng.lat,
+            longitud: latlng.lng,
+            cotaTerreno: elevation,
+            cotaSuministro: 0,
+            caudalIngreso: 0,
+            caudalSalida: 0,
+            caudalSuministro: 0,
+            horasSuministro: 0,
+            horasLlenado: 0,
+            volumenRequerido: 0,
+            volumenReserva: 0,
+            volumenContraIncendio: 0,
+        };
+        toast({ title: "Tanque Elevado Creado", description: `Se ha creado el tanque ${newTanque.id} con cota ${elevation?.toFixed(2) ?? 'N/A'}m.` });
+        return newTanque;
+    };
+
+    if (drawingMode === 'node') {
+        if (clickedPipe) {
+            await handlePipeSplit(clickedPipe, latlng);
+        } else if (!clickedComponent) {
+            const newNode = await createNewNode(latlng, model);
+            if (newNode) {
+                updateModel(current => ({ ...current, nodes: [...current.nodes, newNode] }));
+            }
+        }
+    } else if (drawingMode === 'reservoir') {
+        const newReservoir = await createNewReservoir(latlng, model);
+        if (newReservoir) {
+            updateModel(current => ({ ...current, reservoirs: [...current.reservoirs, newReservoir] }));
+        }
+    } else if (drawingMode === 'wtp') {
+        const newPTAP = await createNewPTAP(latlng, model);
+        if (newPTAP) {
+            updateModel(current => ({ ...current, ptaps: [...current.ptaps, newPTAP] }));
+        }
+    } else if (drawingMode === 'intake') {
+        const newBocatoma = await createNewBocatoma(latlng, model);
+        if (newBocatoma) {
+            updateModel(current => ({ ...current, bocatomas: [...current.bocatomas, newBocatoma] }));
+        }
+    } else if (drawingMode === 'captation') {
+        const newCaptacion = await createNewCaptacion(latlng, model);
+        if (newCaptacion) {
+            updateModel(current => ({ ...current, captaciones: [...current.captaciones, newCaptacion] }));
+        }
+    } else if (drawingMode === 'well') {
+        const newPozo = await createNewPozoProfundo(latlng, model);
+        if (newPozo) {
+            updateModel(current => ({ ...current, pozosProfundos: [...current.pozosProfundos, newPozo] }));
+        }
+    } else if (drawingMode === 'tank') {
+        const newTanque = await createNewTanqueElevado(latlng, model);
+        if (newTanque) {
+            updateModel(current => ({ ...current, tanquesElevados: [...current.tanquesElevados, newTanque] }));
+        }
+    } else if (drawingMode === 'pipe' && clickedComponent) {
+      if (!drawingPipeState.startComponent) {
+        setDrawingPipeState({ startComponent: clickedComponent });
+        mapRef.current?.highlightNode(clickedComponent.id, true);
+        mapRef.current?.startGuideLine([clickedComponent.latitud, clickedComponent.longitud]);
+      } else {
+        const startComponent = drawingPipeState.startComponent;
+        const endComponent = clickedComponent;
+
+        if (startComponent.id === endComponent.id) return;
         
-        const newPipe = createNewPipe(startNode, endNode, model.pipes);
+        const newPipe = createNewPipe(startComponent, endComponent, model.pipes);
 
         updateModel(current => {
-            mapRef.current?.highlightNode(startNode.id, false); 
-            setDrawingPipeState({ startNode: endNode });
-            mapRef.current?.highlightNode(endNode.id, true);
-            mapRef.current?.startGuideLine([endNode.latitud, endNode.longitud]);
+            mapRef.current?.highlightNode(startComponent.id, false); 
+            setDrawingPipeState({ startComponent: endComponent });
+            mapRef.current?.highlightNode(endComponent.id, true);
+            mapRef.current?.startGuideLine([endComponent.latitud, endComponent.longitud]);
             return { ...current, pipes: [...current.pipes, newPipe] };
         });
       }
     } else if (drawingMode === 'dual') {
-        let startNode: Node | null = drawingPipeState.startNode;
-        let endNode: Node | null = clickedNode;
+        let startComponent: Connectable | null = drawingPipeState.startComponent;
+        let endComponent: Connectable | null = clickedComponent;
 
-        if (!startNode) { // First click of a sequence
-            if (endNode) { // Clicked on existing node
-                startNode = endNode;
-            } else { // Clicked on empty space
-                startNode = await createNewNode(latlng, model);
-                if (startNode) {
-                    updateModel(current => ({ ...current, nodes: [...current.nodes, startNode!] }));
+        if (!startComponent) { // First click of a sequence
+            if (endComponent) { // Clicked on existing component
+                startComponent = endComponent;
+            } else { // Clicked on empty space, create a node
+                startComponent = await createNewNode(latlng, model);
+                if (startComponent) {
+                    updateModel(current => ({ ...current, nodes: [...current.nodes, startComponent as Node] }));
                 }
             }
-            if (startNode) {
-                setDrawingPipeState({ startNode });
-                mapRef.current?.highlightNode(startNode.id, true);
-                mapRef.current?.startGuideLine([startNode.latitud, startNode.longitud]);
+            if (startComponent) {
+                setDrawingPipeState({ startComponent });
+                mapRef.current?.highlightNode(startComponent.id, true);
+                mapRef.current?.startGuideLine([startComponent.latitud, startComponent.longitud]);
             }
         } else { // Subsequent clicks
-            if (endNode && startNode.id === endNode.id) return; // Avoid self-connecting pipe
+            if (endComponent && startComponent.id === endComponent.id) return; // Avoid self-connecting pipe
 
-            if (!endNode) { // If not clicking an existing node, create a new one
-                endNode = await createNewNode(latlng, model);
+            if (!endComponent) { // If not clicking an existing component, create a new one (a node)
+                endComponent = await createNewNode(latlng, model);
             }
-            if (!endNode) return; // Stop if node creation failed
+            if (!endComponent) return; // Stop if node creation failed
 
-            const newPipe = createNewPipe(startNode, endNode, model.pipes);
+            const newPipe = createNewPipe(startComponent, endComponent, model.pipes);
             
             updateModel(current => {
-                mapRef.current?.highlightNode(startNode!.id, false);
-                setDrawingPipeState({ startNode: endNode });
-                mapRef.current?.highlightNode(endNode!.id, true);
-                mapRef.current?.startGuideLine([endNode!.latitud, endNode!.longitud]);
+                mapRef.current?.highlightNode(startComponent!.id, false);
+                setDrawingPipeState({ startComponent: endComponent });
+                mapRef.current?.highlightNode(endComponent!.id, true);
+                mapRef.current?.startGuideLine([endComponent!.latitud, endComponent!.longitud]);
                 
-                const modelHasEndNode = current.nodes.some(n => n.id === endNode!.id);
-                return {
-                    nodes: modelHasEndNode ? current.nodes : [...current.nodes, endNode!],
-                    pipes: [...current.pipes, newPipe]
-                };
+                const modelHasEndNode = [...current.nodes, ...current.reservoirs, ...current.ptaps, ...current.bocatomas, ...current.captaciones, ...current.pozosProfundos, ...current.tanquesElevados].some(c => c.id === endComponent!.id);
+                
+                if (modelHasEndNode) {
+                     return { ...current, pipes: [...current.pipes, newPipe] };
+                } else {
+                    // Assuming new un-clicked components are always nodes
+                     return {
+                        ...current,
+                        nodes: [...current.nodes, endComponent as Node],
+                        pipes: [...current.pipes, newPipe]
+                    };
+                }
             });
         }
     } else if (drawingMode === 'mesh') {
         if (meshState.status === 'settingStart') {
             setMeshState(prev => ({ ...prev, status: 'settingEnd', startPoint: latlng }));
-            mapRef.current?.startGuideLine([latlng.lat, latlng.lng]);
-             toast({
-                title: "Fijar Orientación de Malla",
-                description: "Haga clic para definir la dirección y longitud del primer eje horizontal.",
+            mapRef.current?.startGuideLine([latlng.lat, latlng.lng], { color: 'orange', dashArray: '10, 10' });
+            toast({
+                title: "Fijar Fin de Malla",
+                description: "Haga clic en el mapa para establecer el punto final del primer lado de la malla.",
             });
         } else if (meshState.status === 'settingEnd' && meshState.startPoint) {
-            mapRef.current?.stopGuideLine();
             setDrawingMode(null);
+            mapRef.current?.stopGuideLine();
             await generateMesh(meshState.startPoint, latlng, meshState.params, model);
             setMeshState({ // Reset state
                 status: 'configuring',
@@ -521,36 +924,268 @@ export default function Home() {
             setMeasureState(prev => ({ ...prev, status: 'measuring', startPoint: latlng, distance: null }));
             mapRef.current?.startGuideLine([latlng.lat, latlng.lng], { color: 'red', dashArray: undefined });
         } else if (measureState.status === 'measuring' && measureState.startPoint) {
-            const distanceInMeters = measureState.startPoint.distanceTo(latlng);
+            const distanceInMeters = mapRef.current?.calculateDistance([measureState.startPoint.lat, measureState.startPoint.lng], [latlng.lat, latlng.lng]) || 0;
             mapRef.current?.stopGuideLine();
             mapRef.current?.drawMeasurementResultLine(measureState.startPoint, latlng);
             setMeasureState(prev => ({ ...prev, status: 'idle', startPoint: null, distance: distanceInMeters }));
         }
+    } else if (drawingMode === 'viewer') {
+        const newPoints = [...viewerBoxPoints, latlng];
+        setViewerBoxPoints(newPoints);
+        if (newPoints.length === 1) {
+            mapRef.current?.startGuideLine([latlng.lat, latlng.lng], { color: 'orange', dashArray: '10, 10' });
+            toast({ title: 'Visor: Punto Inicial Fijado', description: 'Seleccione el punto diagonal opuesto para definir el área de zoom.' });
+        } else if (newPoints.length === 2) {
+            handleFitBounds(newPoints[0], newPoints[1]);
+        }
     } else if (drawingMode === 'delete-component') {
-      if (clickedNode) {
-        updateModel(current => {
-            const nodeIdToDelete = clickedNode.id;
-            const newNodes = current.nodes.filter(n => n.id !== nodeIdToDelete);
-            const newPipes = current.pipes.filter(p => p.startNodeId !== nodeIdToDelete && p.endNodeId !== nodeIdToDelete);
-            const pipesDeletedCount = current.pipes.length - newPipes.length;
-            toast({
-                title: "Componente Eliminado",
-                description: `Se eliminó el nudo ${nodeIdToDelete} y ${pipesDeletedCount} tuberías conectadas.`
+        if (clickedComponent) {
+            if (clickedComponent.id.startsWith('N')) {
+                updateModel(current => {
+                    const nodeIdToDelete = clickedComponent.id;
+                    const newNodes = current.nodes.filter(n => n.id !== nodeIdToDelete);
+                    const newPipes = current.pipes.filter(p => p.startNodeId !== nodeIdToDelete && p.endNodeId !== nodeIdToDelete);
+                    const pipesDeletedCount = current.pipes.length - newPipes.length;
+                    toast({
+                        title: "Componente Eliminado",
+                        description: `Se eliminó el nudo ${nodeIdToDelete} y ${pipesDeletedCount} tuberías conectadas.`
+                    });
+                    return { ...current, nodes: newNodes, pipes: newPipes };
+                });
+            } else if (clickedComponent.id.startsWith('R')) {
+                updateModel(current => {
+                    const reservoirIdToDelete = clickedComponent.id;
+                    const newReservoirs = current.reservoirs.filter(r => r.id !== reservoirIdToDelete);
+                    const newPipes = current.pipes.filter(p => p.startNodeId !== reservoirIdToDelete && p.endNodeId !== reservoirIdToDelete);
+                    const pipesDeletedCount = current.pipes.length - newPipes.length;
+                    toast({
+                        title: "Componente Eliminado",
+                        description: `Se eliminó el reservorio ${reservoirIdToDelete} y ${pipesDeletedCount} tuberías conectadas.`
+                    });
+                    return { ...current, reservoirs: newReservoirs, pipes: newPipes };
+                });
+            }
+        } else if (clickedPipe) {
+            updateModel(current => {
+                const newPipes = current.pipes.filter(p => p.id !== clickedPipe.id);
+                toast({
+                    title: "Componente Eliminado",
+                    description: `Se eliminó la tubería ${clickedPipe.id}.`
+                });
+                return { ...current, pipes: newPipes };
             });
-            return { nodes: newNodes, pipes: newPipes };
-        });
-      } else if (clickedPipe) {
-          updateModel(current => {
-              const newPipes = current.pipes.filter(p => p.id !== clickedPipe.id);
-              toast({
-                  title: "Componente Eliminado",
-                  description: `Se eliminó la tubería ${clickedPipe.id}.`
-              });
-              return { ...current, pipes: newPipes };
-          });
-      }
+        } else if (clickedVertex) {
+             updateModel(current => {
+                const vertexIdToDelete = clickedVertex.id;
+                // 1. Remove the vertex from the main vertices list
+                const newVertices = current.vertices.filter(v => v.id !== vertexIdToDelete);
+
+                // 2. Remove the vertex from any pipe that includes it and recalculate length
+                const newPipes = current.pipes.map(pipe => {
+                    if (pipe.vertexIds?.includes(vertexIdToDelete)) {
+                        const newVertexIds = pipe.vertexIds.filter(id => id !== vertexIdToDelete);
+                        
+                        const allConnectables: Connectable[] = [...current.nodes, ...current.reservoirs];
+                        const startNode = allConnectables.find(c => c.id === pipe.startNodeId);
+                        const endNode = allConnectables.find(c => c.id === pipe.endNodeId);
+                        if (!startNode || !endNode) return pipe;
+
+                        const allPipeVertices = newVertexIds.map(vId => newVertices.find(v => v.id === vId)).filter((v): v is Vertex => !!v);
+
+                        const allPoints = [
+                            { lat: startNode.latitud, lng: startNode.longitud },
+                            ...allPipeVertices.map(v => ({ lat: v.latitud, lng: v.longitud })),
+                            { lat: endNode.latitud, lng: endNode.longitud }
+                        ];
+
+                        let newLength = 0;
+                        for (let i = 0; i < allPoints.length - 1; i++) {
+                            newLength += mapRef.current?.calculateDistance(
+                                [allPoints[i].lat, allPoints[i].lng],
+                                [allPoints[i + 1].lat, allPoints[i + 1].lng]
+                            ) || 0;
+                        }
+
+                        return { ...pipe, vertexIds: newVertexIds, length: newLength };
+                    }
+                    return pipe;
+                });
+                
+                toast({
+                    title: "Componente Eliminado",
+                    description: `Se eliminó el vértice ${vertexIdToDelete}.`
+                });
+
+                return { ...current, vertices: newVertices, pipes: newPipes };
+            });
+        }
+    } else if (drawingMode === 'delete-selection') {
+        setSelectionPolygon(prev => [...prev, latlng]);
+    } else if (drawingMode === 'vertex' && clickedPipe) {
+        if (clickedPipe.id.startsWith('T-')) {
+            await handleInsertVertex(clickedPipe.id, latlng);
+        } else {
+            toast({
+                title: 'Función no disponible',
+                description: 'La inserción de vértices actualmente solo está soportada para tuberías de distribución.',
+                variant: 'destructive',
+            });
+        }
     }
   };
+
+  const handleMapDoubleClick = () => {
+    if (drawingMode === 'delete-selection' && selectionPolygon.length > 2) {
+      handleDeleteSelection();
+    }
+  };
+
+  const handleNodeMove = async (nodeId: string, newLatLng: LatLng) => {
+    toast({ title: `Moviendo ${nodeId}...`, description: "Obteniendo nueva cota del terreno." });
+    const newElevation = await getElevation(newLatLng.lat, newLatLng.lng);
+  
+    updateModel(current => {
+      const movedNode = current.nodes.find(n => n.id === nodeId);
+      if (!movedNode) return current;
+  
+      // Check for fusion
+      const FUSION_DISTANCE_THRESHOLD = 5; // meters
+      const targetNode = current.nodes.find(n => {
+        if (n.id === nodeId) return false;
+        const distance = mapRef.current?.calculateDistance([newLatLng.lat, newLatLng.lng], [n.latitud, n.longitud]) || FUSION_DISTANCE_THRESHOLD + 1;
+        return distance < FUSION_DISTANCE_THRESHOLD;
+      });
+  
+      if (targetNode) {
+        // Fusion logic
+        const movedNodeNum = parseInt(movedNode.id.substring(1), 10);
+        const targetNodeNum = parseInt(targetNode.id.substring(1), 10);
+  
+        const [nodeToKeep, nodeToRemove] = movedNodeNum < targetNodeNum
+          ? [movedNode, targetNode]
+          : [targetNode, movedNode];
+  
+        toast({
+          title: "Fusión de Nudos",
+          description: `El nudo ${nodeToRemove.id} se ha fusionado con ${nodeToKeep.id}.`,
+        });
+  
+        // Re-assign pipes from removed node to the kept node
+        const remappedPipes = current.pipes.map(pipe => {
+          if (pipe.startNodeId === nodeToRemove.id) {
+            return { ...pipe, startNodeId: nodeToKeep.id };
+          }
+          if (pipe.endNodeId === nodeToRemove.id) {
+            return { ...pipe, endNodeId: nodeToKeep.id };
+          }
+          return pipe;
+        });
+  
+        // Filter out self-looping pipes and duplicates
+        const uniquePipeKeys = new Set<string>();
+        const finalPipes = remappedPipes.filter(pipe => {
+          if (pipe.startNodeId === pipe.endNodeId) {
+            return false; // Remove self-looping pipe
+          }
+          // Create a canonical key for the pipe to detect duplicates regardless of direction
+          const key = [pipe.startNodeId, pipe.endNodeId].sort().join('-');
+          if (uniquePipeKeys.has(key)) {
+            return false; // Remove duplicate pipe
+          }
+          uniquePipeKeys.add(key);
+          return true;
+        });
+  
+        return {
+          ...current,
+          nodes: current.nodes.filter(n => n.id !== nodeToRemove.id),
+          pipes: finalPipes,
+        };
+  
+      } else {
+        // Standard move logic
+        const newNodes = current.nodes.map(node =>
+          node.id === nodeId
+            ? {
+                ...node,
+                latitud: newLatLng.lat,
+                longitud: newLatLng.lng,
+                cotaTerreno: newElevation ?? node.cotaTerreno,
+              }
+            : node
+        );
+  
+        toast({
+          title: "Nudo Movido",
+          description: `${nodeId} actualizado a la nueva posición con cota ${newElevation?.toFixed(2) ?? 'N/A'}m.`,
+        });
+  
+        return { ...current, nodes: newNodes };
+      }
+    });
+  };
+
+  const handleVertexMove = async (vertexId: string, newLatLng: LatLng) => {
+    toast({ title: `Moviendo Vértice ${vertexId}...`, description: "Obteniendo nueva cota." });
+    const newElevation = await getElevation(newLatLng.lat, newLatLng.lng);
+
+    updateModel(current => {
+        // 1. Update the vertex's own properties
+        const newVertices = current.vertices.map(v => 
+            v.id === vertexId
+                ? { ...v, latitud: newLatLng.lat, longitud: newLatLng.lng, cotaTerreno: newElevation }
+                : v
+        );
+
+        // 2. Find affected pipes and update their length
+        const newPipes = current.pipes.map(pipe => {
+            if (pipe.vertexIds?.includes(vertexId)) {
+                const allConnectables: Connectable[] = [...current.nodes, ...current.reservoirs];
+                const startNode = allConnectables.find(c => c.id === pipe.startNodeId);
+                const endNode = allConnectables.find(c => c.id === pipe.endNodeId);
+                if (!startNode || !endNode) return pipe;
+
+                const allPipeVertices = (pipe.vertexIds || []).map(vId => {
+                    return newVertices.find(v => v.id === vId);
+                }).filter((v): v is Vertex => v !== undefined);
+
+                const allPoints = [
+                    { lat: startNode.latitud, lng: startNode.longitud },
+                    ...allPipeVertices.map(v => ({ lat: v.latitud, lng: v.longitud })),
+                    { lat: endNode.latitud, lng: endNode.longitud }
+                ];
+                
+                let newLength = 0;
+                for (let i = 0; i < allPoints.length - 1; i++) {
+                    newLength += mapRef.current?.calculateDistance(
+                        [allPoints[i].lat, allPoints[i].lng],
+                        [allPoints[i + 1].lat, allPoints[i + 1].lng]
+                    ) || 0;
+                }
+                
+                toast({
+                    title: "Longitud de Tubería Actualizada",
+                    description: `La longitud de ${pipe.id} ahora es ${newLength.toFixed(2)}m.`
+                });
+
+                return { ...pipe, length: newLength };
+            }
+            return pipe;
+        });
+
+        toast({
+            title: "Vértice Movido",
+            description: `${vertexId} actualizado a la nueva posición con cota ${newElevation?.toFixed(2) ?? 'N/A'}m.`
+        });
+        
+        return {
+            ...current,
+            vertices: newVertices,
+            pipes: newPipes
+        };
+    });
+};
+
 
   const handleSave = () => {
     if (!projectData) {
@@ -720,7 +1355,7 @@ export default function Home() {
         description: `Se han renumerado ${newNodes.length} nudos y ${newPipes.length} tuberías.`,
       });
 
-      return { nodes: newNodes, pipes: newPipes };
+      return { ...current, nodes: newNodes, pipes: newPipes };
     });
   };
 
@@ -780,13 +1415,19 @@ export default function Home() {
         description: `Se eliminaron ${nodesRemovedCount} nudos huérfanos, ${duplicatesRemovedCount} nudos duplicados y ${pipesRemovedCount} tuberías aisladas.`,
       });
 
-      return { nodes, pipes };
+      return { ...current, nodes, pipes };
     });
   };
 
   const handleToolSelect = (tool: DrawingMode | 'project' | null) => {
+    // Always cancel any ongoing drawing when a new tool is selected.
     cancelDrawing();
-    
+    // Explicitly clear start component state when changing tools
+    if (drawingPipeState.startComponent) {
+      mapRef.current?.highlightNode(drawingPipeState.startComponent.id, false);
+      setDrawingPipeState({ startComponent: null });
+    }
+
     if (tool === 'project') {
       handleOpenProjectDialog();
       setDrawingMode(null);
@@ -802,7 +1443,13 @@ export default function Home() {
     } else if (tool === 'undo') {
       handleUndo();
       setDrawingMode(null);
-    } else if (tool === 'reservoir' || tool === 'valve' || tool === 'pump' || tool === 'tank' || tool === 'wtp' || tool === 'well' || tool === 'intake' || tool === 'vertex' || tool === 'delete-selection' || tool === 'move' || tool === 'viewer') {
+    } else if (tool === 'pump') {
+        toast({
+            title: "Herramienta no implementada",
+            description: "Esta funcionalidad estará disponible en futuras versiones.",
+        });
+        setDrawingMode(null);
+    } else if (tool === 'valve-purge' || tool === 'valve-air' || tool === 'valve-control' || tool === 'chamber-pumping' || tool === 'chamber-junction' || tool === 'chamber-pressure-break') {
         toast({
             title: "Herramienta no implementada",
             description: "Esta funcionalidad estará disponible en futuras versiones.",
@@ -812,15 +1459,18 @@ export default function Home() {
     else {
       setDrawingMode(prev => {
         const newMode = prev === tool ? null : tool;
-        setHideNodeTooltips(newMode === 'pipe' || newMode === 'dual' || newMode === 'mesh' || newMode === 'delete-component');
+        // Any drawing/editing tool is active, hide tooltips. If no tool, show them.
+        setHideNodeTooltips(newMode !== null);
+        
         if (newMode === null) {
-            cancelDrawing();
-        } else {
-            if (drawingPipeState.startNode) {
-                mapRef.current?.highlightNode(drawingPipeState.startNode.id, false);
-                setDrawingPipeState({ startNode: null });
-                mapRef.current?.stopGuideLine();
-            }
+            cancelDrawing(); // Handles cleanup if the same tool is clicked to disable it
+        }
+
+        if (newMode === 'delete-selection') {
+          toast({ title: 'Modo "Borrar por Selección"', description: 'Dibuja un polígono. Doble clic o presiona Enter para eliminar los elementos dentro.' });
+        }
+        if (newMode === 'viewer') {
+            toast({ title: 'Modo "Visor"', description: 'Haga clic en un punto inicial para definir el área de zoom.' });
         }
         return newMode;
       });
@@ -844,17 +1494,18 @@ export default function Home() {
       updateModel(() => initialModel);
       await new Promise(resolve => setTimeout(resolve, 50)); 
 
-      const { nodes: importedNodes, pipes: importedPipes } = await processKmlFile(file);
+      const { nodes: importedNodes, pipes: importedPipes, vertices: importedVertices } = await processKmlFile(file);
       
       updateModel(current => ({
         ...current,
         nodes: importedNodes,
         pipes: importedPipes,
+        vertices: importedVertices,
       }));
 
       toast({
         title: 'Importación Exitosa',
-        description: `Se importaron ${importedNodes.length} nudos y ${importedPipes.length} tuberías.`,
+        description: `Se importaron ${importedNodes.length} nudos, ${importedPipes.length} tuberías y ${importedVertices.length} vértices.`,
       });
 
       if (!projectData) {
@@ -903,60 +1554,101 @@ export default function Home() {
                   return;
               }
               
-              let importedNodes: Node[] = [];
-              if (options.nodes) {
-                  const findHeader = (aliases: string[]) => {
-                      return results.meta.fields?.find(h => aliases.includes(h.toLowerCase()));
-                  }
+              const findHeader = (aliases: string[]) => {
+                  return results.meta.fields?.find(h => aliases.includes(h.toLowerCase()));
+              }
 
+              let importedNodes: Node[] = [];
+              let importedPipes: Pipe[] = [];
+
+              if (options.nodes) {
                   const idHeader = findHeader(['id', 'ids']);
                   const latHeader = findHeader(['lat', 'latitud']);
                   const lngHeader = findHeader(['lng', 'lon', 'longitud']);
                   const elevHeader = findHeader(['elevation', 'elevacion', 'cota', 'cotaterreno']);
 
                   if (!latHeader || !lngHeader) {
-                      toast({ title: "Faltan columnas requeridas", description: "El archivo CSV debe contener cabeceras para latitud (ej: 'lat') y longitud (ej: 'lng').", variant: "destructive"});
-                      return;
-                  }
-
-                  const existingNodeIds = new Set(model.nodes.map(n => n.id));
-                  let nextNodeIdCounter = (model.nodes.length > 0 ? Math.max(...model.nodes.map(n => parseInt(n.id.substring(1)) || 0)) : 0) + 1;
-                  
-                  importedNodes = (results.data as any[]).map((row: any, index: number) => {
-                      const lat = parseFloat(row[latHeader]);
-                      const lng = parseFloat(row[lngHeader]);
-
-                      if (isNaN(lat) || isNaN(lng)) {
-                          console.warn(`Saltando fila ${index + 2} por coordenadas inválidas.`);
-                          return null;
-                      }
-
-                      let id = idHeader && row[idHeader] ? String(row[idHeader]).trim() : '';
-                      if (!id || existingNodeIds.has(id)) {
-                          id = `N${nextNodeIdCounter++}`;
-                      }
+                      toast({ title: "Faltan columnas de nudos requeridas", description: "El archivo CSV de nudos debe contener cabeceras para latitud y longitud.", variant: "destructive"});
+                  } else {
+                      const existingNodeIds = new Set(model.nodes.map(n => n.id));
+                      let nextNodeIdCounter = (model.nodes.length > 0 ? Math.max(...model.nodes.map(n => parseInt(n.id.substring(1)) || 0)) : 0) + 1;
                       
-                      const cota = elevHeader && row[elevHeader] ? parseFloat(row[elevHeader]) : null;
+                      importedNodes = (results.data as any[]).map((row: any, index: number) => {
+                          const lat = parseFloat(row[latHeader]);
+                          const lng = parseFloat(row[lngHeader]);
 
-                      return {
-                          id,
-                          latitud: lat,
-                          longitud: lng,
-                          cotaTerreno: cota && !isNaN(cota) ? cota : null,
-                          type: 'node',
-                      };
-                  }).filter((node): node is Node => node !== null && !existingNodeIds.has(node.id));
+                          if (isNaN(lat) || isNaN(lng)) {
+                              console.warn(`Saltando fila de nudo ${index + 2} por coordenadas inválidas.`);
+                              return null;
+                          }
+
+                          let id = idHeader && row[idHeader] ? String(row[idHeader]).trim() : '';
+                          if (!id || existingNodeIds.has(id)) {
+                              id = `N${nextNodeIdCounter++}`;
+                          }
+                          
+                          const cota = elevHeader && row[elevHeader] ? parseFloat(row[elevHeader]) : null;
+
+                          return {
+                              id,
+                              latitud: lat,
+                              longitud: lng,
+                              cotaTerreno: cota && !isNaN(cota) ? cota : null,
+                              type: 'node',
+                          };
+                      }).filter((node): node is Node => node !== null && !existingNodeIds.has(node.id));
+                  }
               }
 
-              if (importedNodes.length > 0) {
+              if (options.pipes) {
+                  const idHeader = findHeader(['id', 'ids', 'pipeid']);
+                  const startHeader = findHeader(['startnodeid', 'startnode', 'inicio']);
+                  const endHeader = findHeader(['endnodeid', 'endnode', 'fin']);
+                  const lengthHeader = findHeader(['length', 'longitud']);
+
+                  if (!startHeader || !endHeader) {
+                       toast({ title: "Faltan columnas de tuberías requeridas", description: "El archivo CSV de tuberías debe contener cabeceras para el nudo inicial y final.", variant: "destructive"});
+                  } else {
+                      const existingPipeIds = new Set(model.pipes.map(p => p.id));
+                      let nextPipeIdCounter = (model.pipes.length > 0 ? Math.max(...model.pipes.map(p => parseInt(p.id.substring(2)) || 0)) : 0) + 1;
+
+                      importedPipes = (results.data as any[]).map((row: any, index: number) => {
+                          const startNodeId = row[startHeader];
+                          const endNodeId = row[endHeader];
+                          const length = lengthHeader && row[lengthHeader] ? parseFloat(row[lengthHeader]) : 0;
+                          
+                          if (!startNodeId || !endNodeId) {
+                            console.warn(`Saltando fila de tubería ${index + 2} por falta de nudos.`);
+                            return null;
+                          }
+
+                          let id = idHeader && row[idHeader] ? String(row[idHeader]).trim() : '';
+                          if (!id || existingPipeIds.has(id)) {
+                            id = `T-${nextPipeIdCounter++}`;
+                          }
+
+                          return {
+                            id,
+                            startNodeId: String(startNodeId),
+                            endNodeId: String(endNodeId),
+                            length: !isNaN(length) ? length : 0,
+                            type: 'distribution',
+                            vertexIds: []
+                          };
+                      }).filter((pipe): pipe is Pipe => pipe !== null && !existingPipeIds.has(pipe.id));
+                  }
+              }
+
+              if (importedNodes.length > 0 || importedPipes.length > 0) {
                   updateModel((current) => ({
                       ...current,
                       nodes: [...current.nodes, ...importedNodes],
+                      pipes: [...current.pipes, ...importedPipes],
                   }));
 
                   toast({
                       title: "Importación CSV Exitosa",
-                      description: `Se importaron ${importedNodes.length} nuevos elementos.`
+                      description: `Se importaron ${importedNodes.length} nudos y ${importedPipes.length} tuberías.`
                   });
 
                   if (importedNodes.length > 0 && model.nodes.length === 0) {
@@ -969,8 +1661,7 @@ export default function Home() {
               } else {
                   toast({
                       title: "Importación CSV",
-                      description: "No se encontraron nuevos elementos para importar en el archivo o el tipo de componente no fue seleccionado.",
-                      variant: "destructive",
+                      description: "No se encontraron nuevos elementos para importar o los tipos de componente no fueron seleccionados.",
                   });
               }
           },
@@ -1097,7 +1788,7 @@ export default function Home() {
     }
 
     try {
-        const kmlContent = generateKml(nodes, pipes, projectData.nombre || 'HydroBIM Project');
+        const kmlContent = generateKml(nodes, pipes, vertices, projectData.nombre || 'HydroBIM Project');
         const blob = new Blob([kmlContent], { type: 'application/vnd.google-earth.kml+xml;charset=utf-8' });
         const fileName = `${projectData.nombre.replace(/\s+/g, '_') || 'hydrobim-project'}.kml`;
         saveAs(blob, fileName);
@@ -1141,7 +1832,18 @@ export default function Home() {
         if (data && data.project && data.model && Array.isArray(data.model.nodes) && Array.isArray(data.model.pipes)) {
           setProjectData(data.project);
           
-          const loadedModel = data.model;
+          const loadedModel: HydroModel = {
+            ...initialModel,
+            ...data.model,
+            pipes: (data.model.pipes || []).map((p: Pipe) => ({ ...p, vertexIds: p.vertexIds || [] })),
+            vertices: data.model.vertices || [],
+            reservoirs: (data.model.reservoirs || []).map((r: any) => ({ ...r, horasConsumo: r.horasConsumo || 0, horasLlenado: r.horasLlenado || 0, volumenReserva: r.volumenReserva || 0, volumenContraIncendio: r.volumenContraIncendio || 0 })),
+            ptaps: data.model.ptaps || [],
+            bocatomas: data.model.bocatomas || [],
+            captaciones: data.model.captaciones || [],
+            pozosProfundos: data.model.pozosProfundos || [],
+            tanquesElevados: data.model.tanquesElevados || [],
+          };
           setModel(loadedModel);
           setHistory([loadedModel]);
           setHistoryIndex(0);
@@ -1188,15 +1890,23 @@ export default function Home() {
     setMeshState(prev => ({ ...prev, status: 'settingStart' }));
     toast({
         title: "Fijar Inicio de Malla",
-        description: "Haga clic en el mapa para establecer la esquina de la malla.",
+        description: "Haga clic en el mapa para establecer el punto inicial del primer lado de la malla.",
     });
   };
+
+  const handleFitBounds = (point1: LatLng, point2: LatLng) => {
+    mapRef.current?.fitBounds(point1, point2);
+    setDrawingMode(null);
+    setViewerBoxPoints([]);
+    mapRef.current?.stopGuideLine();
+    toast({ title: 'Vista Ajustada', description: 'El mapa se ha centrado en el área seleccionada.' });
+  }
 
   // Measurement Tool Handlers
   const handleMeasureAgain = () => {
     mapRef.current?.clearMeasurementResultLine();
     mapRef.current?.stopGuideLine();
-    setMeasureState(prev => ({ ...prev, status: 'idle', distance: null, startPoint: null }));
+    setMeasureState(prev => ({ ...prev, unit: 'm', distance: null, startPoint: null }));
     toast({
         title: "Medición Reiniciada",
         description: "Haga clic en el mapa para iniciar una nueva medición.",
@@ -1267,6 +1977,7 @@ export default function Home() {
             <MenubarContent>
               <MenubarItem onSelect={toggleModelingToolbar}>Herramienta de Modelado</MenubarItem>
               <MenubarItem>Topografía</MenubarItem>
+              <MenubarItem disabled>Visor 3D (Deshabilitado)</MenubarItem>
             </MenubarContent>
           </MenubarMenu>
           <MenubarMenu>
@@ -1276,13 +1987,16 @@ export default function Home() {
                 <MenubarSubTrigger>Datos del Modelado</MenubarSubTrigger>
                 <MenubarSubContent>
                   <MenubarItem onSelect={() => setIsNodesDialogOpen(true)}>Nudos</MenubarItem>
-                  <MenubarItem>Vértices</MenubarItem>
+                  <MenubarItem onSelect={() => setIsVerticesDialogOpen(true)}>Vértices</MenubarItem>
                   <MenubarItem onSelect={() => setIsPipesDialogOpen(true)}>Tuberías de Distribución</MenubarItem>
                   <MenubarItem>Tuberías de Aducción</MenubarItem>
                   <MenubarItem>Tuberías de Conducción</MenubarItem>
-                  <MenubarItem>Reservorios</MenubarItem>
-                  <MenubarItem>PTAPs</MenubarItem>
-                  <MenubarItem>Bocatomas</MenubarItem>
+                  <MenubarItem onSelect={() => setIsReservoirsDialogOpen(true)}>Reservorios</MenubarItem>
+                  <MenubarItem onSelect={() => setIsPtapsDialogOpen(true)}>PTAPs</MenubarItem>
+                  <MenubarItem onSelect={() => setIsBocatomasDialogOpen(true)}>Bocatomas</MenubarItem>
+                  <MenubarItem onSelect={() => setIsCaptacionesDialogOpen(true)}>Captaciones</MenubarItem>
+                  <MenubarItem onSelect={() => setIsPozosProfundosDialogOpen(true)}>Pozos Profundos</MenubarItem>
+                  <MenubarItem onSelect={() => setIsTanquesElevadosDialogOpen(true)}>Tanques Elevados</MenubarItem>
                 </MenubarSubContent>
               </MenubarSub>
             </MenubarContent>
@@ -1325,13 +2039,24 @@ export default function Home() {
         />
         <MapComponent 
           ref={mapRef} 
-          onMapClick={handleMapClick} 
+          onMapClick={handleMapClick}
+          onNodeMove={handleNodeMove}
+          onVertexMove={handleVertexMove}
+          onMapDoubleClick={handleMapDoubleClick}
           drawingMode={drawingMode}
           initialCenter={mapCenter}
           initialZoom={mapZoom}
           nodes={nodes}
           pipes={pipes}
+          vertices={vertices}
+          reservoirs={reservoirs}
+          ptaps={ptaps}
+          bocatomas={bocatomas}
+          captaciones={captaciones}
+          pozosProfundos={pozosProfundos}
+          tanquesElevados={tanquesElevados}
           hideNodeTooltips={hideNodeTooltips}
+          selectionPolygon={selectionPolygon}
         />
         {showModelingToolbar && <ModelingToolbar onToolSelect={handleToolSelect} activeTool={drawingMode} canUndo={historyIndex > 0} />}
          {drawingMode === 'mesh' && meshState.status === 'configuring' && (
@@ -1371,6 +2096,13 @@ export default function Home() {
       <ScopesDialog isOpen={isScopesDialogOpen} onOpenChange={setIsScopesDialogOpen} />
       <NodesDialog isOpen={isNodesDialogOpen} onOpenChange={setIsNodesDialogOpen} nodes={nodes} />
       <PipesDialog isOpen={isPipesDialogOpen} onOpenChange={setIsPipesDialogOpen} pipes={pipes} />
+      <VerticesDialog isOpen={isVerticesDialogOpen} onOpenChange={setIsVerticesDialogOpen} vertices={vertices} />
+      <ReservoirsDialog isOpen={isReservoirsDialogOpen} onOpenChange={setIsReservoirsDialogOpen} reservoirs={reservoirs} />
+      <PTAPsDialog isOpen={isPtapsDialogOpen} onOpenChange={setIsPtapsDialogOpen} ptaps={ptaps} />
+      <BocatomasDialog isOpen={isBocatomasDialogOpen} onOpenChange={setIsBocatomasDialogOpen} bocatomas={bocatomas} />
+      <CaptacionesDialog isOpen={isCaptacionesDialogOpen} onOpenChange={setIsCaptacionesDialogOpen} captaciones={captaciones} />
+      <PozosProfundosDialog isOpen={isPozosProfundosDialogOpen} onOpenChange={setIsPozosProfundosDialogOpen} pozosProfundos={pozosProfundos} />
+      <TanquesElevadosDialog isOpen={isTanquesElevadosDialogOpen} onOpenChange={setIsTanquesElevadosDialogOpen} tanquesElevados={tanquesElevados} />
       <CsvImportDialog isOpen={isCsvImportDialogOpen} onOpenChange={setIsCsvImportDialogOpen} onImport={handleCsvImport} />
       <CsvExportDialog
         isOpen={isCsvExportDialogOpen}
